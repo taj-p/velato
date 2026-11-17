@@ -124,8 +124,30 @@ impl Ellipse {
     pub fn evaluate(&self, frame: f64, path: &mut Vec<PathEl>) {
         let center = self.position.evaluate(frame);
         let size = self.size.evaluate(frame);
+        let (width, height) = (size.width.abs(), size.height.abs());
+        // kurbo holds an ellipse as a matrix, and takes the radii and the rotation of its
+        // arc from fourth powers of the coefficients, which overflow for a radius above
+        // 1e77. Its path is then not finite, where the size is. An ellipse that large is
+        // drawn as the arc that kurbo derives for the others, which starts at an end of the
+        // longer axis.
+        const MAX_RADIUS_AS_MATRIX: f64 = 1e70;
+        if width.max(height) * 0.5 > MAX_RADIUS_AS_MATRIX {
+            let start_angle = if width >= height {
+                0.0
+            } else {
+                std::f64::consts::FRAC_PI_2
+            };
+            let arc = kurbo::Arc {
+                center,
+                radii: Vec2::new(width * 0.5, height * 0.5),
+                start_angle,
+                sweep_angle: std::f64::consts::TAU,
+                x_rotation: 0.0,
+            };
+            path.extend(arc.path_elements(arc_tolerance(width.max(height))));
+            return;
+        }
         let ellipse = kurbo::Ellipse::new(center, (size.width * 0.5, size.height * 0.5), 0.0);
-        // The radii that kurbo derives for the arc can overflow where the size does not.
         let radii = ellipse.radii();
         let tolerance = arc_tolerance(2.0 * radii.x.max(radii.y));
         path.extend(ellipse.path_elements(tolerance));

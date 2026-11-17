@@ -3425,4 +3425,63 @@ mod tests {
             .collect();
         assert_eq!(rules, [(true, Fill::NonZero), (true, Fill::NonZero)]);
     }
+
+    #[test]
+    fn ellipse_of_any_finite_size_has_a_finite_path() {
+        // The radii of all but the first are beyond what their fourth power is finite for.
+        for (width, height) in [
+            (1e60, 1e50),
+            (2e154, 2e154),
+            (1e155, 50.0),
+            (50.0, 1e155),
+            (1e100, 1e90),
+            (1.7e308, 1.7e308),
+        ] {
+            let ellipse = json!({
+                "ty": "el",
+                "p": { "a": 0, "k": [0, 0] },
+                "s": { "a": 0, "k": [width, height] },
+            });
+            let shapes = json!([ellipse, fill(100.0)]);
+            let events = render(&composition(json!([shape_layer(1, shapes)])), 0.0, 1.0);
+            let [bounds] = draw_bounds(&events)[..] else {
+                panic!("expected a draw call, got {events:?}");
+            };
+            assert!(bounds.is_finite(), "{bounds:?}");
+            assert!(
+                (bounds.width() / width - 1.0).abs() < 0.01
+                    && (bounds.height() / height - 1.0).abs() < 0.01
+                    && (bounds.x0 + bounds.x1).abs() < 0.01 * width
+                    && (bounds.y0 + bounds.y1).abs() < 0.01 * height,
+                "{width} by {height}: {bounds:?}"
+            );
+        }
+        // The path of a larger ellipse starts where that of a smaller one does, and goes
+        // round the same way.
+        let outline = |width: f64, height: f64| {
+            let ellipse = json!({
+                "ty": "el",
+                "p": { "a": 0, "k": [0, 0] },
+                "s": { "a": 0, "k": [width, height] },
+            });
+            let composition = composition(json!([shape_layer(1, json!([ellipse]))]));
+            let paths = composition.evaluate(0.0).unwrap().layers[0].evaluated_paths();
+            let scale = Affine::scale_non_uniform(1.0 / width, 1.0 / height);
+            (scale * paths[0].clone()).elements().to_vec()
+        };
+        for (wide, tall) in [(2.0, 1.0), (1.0, 2.0), (1.0, 1.0)] {
+            let small = outline(wide * 1e60, tall * 1e60);
+            let large = outline(wide * 1e80, tall * 1e80);
+            assert_eq!(small.len(), large.len());
+            for (small, large) in small.iter().zip(&large) {
+                match (small.end_point(), large.end_point()) {
+                    (Some(small), Some(large)) => {
+                        assert!((small - large).hypot() < 1e-9, "{small:?} and {large:?}");
+                    }
+                    // Both close the path.
+                    (small, large) => assert_eq!(small, large),
+                }
+            }
+        }
+    }
 }
