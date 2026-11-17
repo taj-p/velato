@@ -9,7 +9,7 @@ use super::{
     FilterLayerResult,
 };
 use kurbo::{Affine, PathEl, Rect};
-use peniko::Mix;
+use peniko::{Fill, Mix};
 use std::mem::swap;
 use std::ops::Range;
 
@@ -33,9 +33,11 @@ pub trait RenderSink {
         FilterLayerResult::Unsupported
     }
 
+    /// Strokes `shape` if `stroke` is given, and fills it according to `fill_rule` otherwise.
     fn draw(
         &mut self,
         stroke: Option<&fixed::Stroke>,
+        fill_rule: Fill,
         transform: Affine,
         brush: &fixed::Brush,
         shape: &impl kurbo::Shape,
@@ -417,6 +419,7 @@ fn may_draw(evaluated: &EvaluatedLayer<'_>) -> bool {
 struct DrawData {
     stroke: Option<fixed::Stroke>,
     brush: fixed::Brush,
+    fill_rule: Fill,
     /// Opacity of the style itself.
     alpha: f64,
     transform: Affine,
@@ -437,6 +440,7 @@ impl DrawData {
                 .as_ref()
                 .map(|stroke| stroke.evaluate(frame).into_owned()),
             brush: draw.brush.evaluate(1.0, frame).into_owned(),
+            fill_rule: draw.fill_rule,
             alpha: unit_alpha(draw.opacity.evaluate(frame) / 100.0),
             transform: Affine::IDENTITY,
             geometry,
@@ -921,7 +925,13 @@ impl Batch {
             path.as_slice()
         };
         if !path.is_empty() {
-            scene.draw(draw.stroke.as_ref(), draw.transform, brush, &path);
+            scene.draw(
+                draw.stroke.as_ref(),
+                draw.fill_rule,
+                draw.transform,
+                brush,
+                &path,
+            );
         }
     }
 
@@ -941,7 +951,7 @@ impl Batch {
 mod tests {
     use crate::test_support::*;
     use kurbo::Rect;
-    use peniko::{BlendMode, Compose, Mix};
+    use peniko::{BlendMode, Compose, Fill, Mix};
     use serde_json::json;
 
     #[test]
@@ -952,6 +962,7 @@ mod tests {
         ]));
         let draw = |bounds| Event::Draw {
             stroked: false,
+            fill_rule: Fill::NonZero,
             alpha: 1.0,
             bounds,
         };
@@ -1068,6 +1079,7 @@ mod tests {
         let begin = |index: u32| Event::BeginLayer(format!("layer {index}"));
         let draw = |stroked, alpha, bounds| Event::Draw {
             stroked,
+            fill_rule: Fill::NonZero,
             alpha,
             bounds,
         };
@@ -2237,6 +2249,7 @@ mod tests {
                 Event::BeginLayer("layer 1".into()),
                 Event::Draw {
                     stroked: false,
+                    fill_rule: Fill::NonZero,
                     alpha: 1.0,
                     bounds: Rect::new(10.0, 20.0, 50.0, 50.0),
                 },
@@ -2365,5 +2378,42 @@ mod tests {
                 Rect::new(31.0, 42.0, 36.0, 47.0)
             ]
         );
+    }
+
+    #[test]
+    fn fill_rule_of_a_fill_reaches_the_sink() {
+        let ruled = |shape: serde_json::Value, rule: u8| with(shape, json!({ "r": rule }));
+        let trace_of = |style: serde_json::Value| {
+            let shapes = json!([rect(0.0, 0.0, 10.0, 10.0), style]);
+            trace(&composition(json!([shape_layer(1, shapes)])), 0.0)[1].clone()
+        };
+        assert_eq!(trace_of(fill(100.0)), "fill(1)");
+        assert_eq!(trace_of(ruled(fill(100.0), 1)), "fill(1)");
+        assert_eq!(trace_of(ruled(fill(100.0), 2)), "fill(1, EvenOdd)");
+        assert_eq!(trace_of(gradient("gf", 100.0)), "fill(1)");
+        assert_eq!(
+            trace_of(ruled(gradient("gf", 100.0), 2)),
+            "fill(1, EvenOdd)"
+        );
+    }
+
+    #[test]
+    fn strokes_are_drawn_with_the_default_fill_rule() {
+        let shapes = json!([
+            rect(0.0, 0.0, 10.0, 10.0),
+            with(stroke(100.0), json!({ "r": 2 })),
+            with(gradient("gs", 100.0), json!({ "r": 2 })),
+        ]);
+        let events = render(&composition(json!([shape_layer(1, shapes)])), 0.0, 1.0);
+        let rules: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Draw {
+                    stroked, fill_rule, ..
+                } => Some((*stroked, *fill_rule)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rules, [(true, Fill::NonZero), (true, Fill::NonZero)]);
     }
 }

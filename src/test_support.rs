@@ -6,7 +6,7 @@
 use crate::model::{ImageAsset, fixed};
 use crate::{Composition, RenderSink, Renderer};
 use kurbo::{Affine, Rect, Shape};
-use peniko::{BlendMode, Brush, Compose, Mix};
+use peniko::{BlendMode, Brush, Compose, Fill, Mix};
 use serde_json::{Value, json};
 use std::fmt;
 
@@ -29,6 +29,7 @@ pub(crate) enum Event {
     /// `bounds` is the bounding box of the path in output coordinates, before stroking.
     Draw {
         stroked: bool,
+        fill_rule: Fill,
         alpha: f32,
         bounds: Rect,
     },
@@ -57,9 +58,16 @@ impl fmt::Display for Event {
             Self::Pop => write!(f, "pop"),
             Self::Draw {
                 stroked: false,
+                fill_rule: Fill::NonZero,
                 alpha,
                 ..
             } => write!(f, "fill({alpha})"),
+            Self::Draw {
+                stroked: false,
+                fill_rule: Fill::EvenOdd,
+                alpha,
+                ..
+            } => write!(f, "fill({alpha}, EvenOdd)"),
             Self::Draw {
                 stroked: true,
                 alpha,
@@ -124,6 +132,7 @@ impl RenderSink for RecordingSink {
     fn draw(
         &mut self,
         stroke: Option<&fixed::Stroke>,
+        fill_rule: Fill,
         transform: Affine,
         brush: &fixed::Brush,
         shape: &impl Shape,
@@ -139,6 +148,7 @@ impl RenderSink for RecordingSink {
         };
         self.events.push(Event::Draw {
             stroked: stroke.is_some(),
+            fill_rule,
             alpha,
             bounds: transform.transform_rect_bbox(shape.bounding_box()),
         });

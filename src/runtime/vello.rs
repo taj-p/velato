@@ -29,6 +29,7 @@ impl RenderSink for vello::Scene {
     fn draw(
         &mut self,
         stroke: Option<&fixed::Stroke>,
+        fill_rule: Fill,
         transform: Affine,
         brush: &fixed::Brush,
         shape: &impl Shape,
@@ -36,7 +37,7 @@ impl RenderSink for vello::Scene {
         if let Some(stroke) = stroke {
             self.stroke(stroke, transform, brush, None, shape);
         } else {
-            self.fill(Fill::NonZero, transform, brush, None, shape);
+            self.fill(fill_rule, transform, brush, None, shape);
         }
     }
 
@@ -76,6 +77,7 @@ impl RenderSink for VelloSceneSink<'_> {
     fn draw(
         &mut self,
         stroke: Option<&fixed::Stroke>,
+        fill_rule: Fill,
         transform: Affine,
         brush: &fixed::Brush,
         shape: &impl Shape,
@@ -83,8 +85,7 @@ impl RenderSink for VelloSceneSink<'_> {
         if let Some(stroke) = stroke {
             self.scene.stroke(stroke, transform, brush, None, shape);
         } else {
-            self.scene
-                .fill(Fill::NonZero, transform, brush, None, shape);
+            self.scene.fill(fill_rule, transform, brush, None, shape);
         }
     }
 
@@ -190,5 +191,34 @@ mod tests {
         let scene =
             Renderer::new().render_to_vello_scene(&animation, &images, 0.0, Affine::IDENTITY, 1.0);
         assert_eq!(scene.encoding().resources.patches.len(), 1);
+    }
+
+    #[test]
+    fn fill_rule_is_passed_on_to_vello_scenes() {
+        let brush = fixed::Brush::default();
+        let shape = kurbo::Rect::new(0.0, 0.0, 10.0, 10.0);
+        let encode = |fill_rule| {
+            let mut scene = vello::Scene::new();
+            RenderSink::draw(
+                &mut scene,
+                None,
+                fill_rule,
+                Affine::IDENTITY,
+                &brush,
+                &shape,
+            );
+            let mut sink_scene = vello::Scene::new();
+            let mut sink = VelloSceneSink {
+                scene: &mut sink_scene,
+                images: &HashMap::new(),
+            };
+            sink.draw(None, fill_rule, Affine::IDENTITY, &brush, &shape);
+            let mut expected = vello::Scene::new();
+            expected.fill(fill_rule, Affine::IDENTITY, &brush, None, &shape);
+            assert_eq!(scene.encoding().styles, expected.encoding().styles);
+            assert_eq!(sink_scene.encoding().styles, expected.encoding().styles);
+            scene.encoding().styles.clone()
+        };
+        assert_ne!(encode(Fill::NonZero), encode(Fill::EvenOdd));
     }
 }

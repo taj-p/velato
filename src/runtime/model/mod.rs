@@ -227,6 +227,8 @@ pub struct Draw {
     pub brush: Brush,
     /// Opacity of the draw operation.
     pub opacity: Value<f64>,
+    /// Rule that decides which parts of the paths a fill covers. Strokes do not use it.
+    pub fill_rule: peniko::Fill,
 }
 
 /// Elements of a shape layer.

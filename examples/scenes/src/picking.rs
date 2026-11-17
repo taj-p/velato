@@ -183,6 +183,7 @@ impl RenderSink for PickingScene<'_> {
     fn draw(
         &mut self,
         stroke: Option<&fixed::Stroke>,
+        fill_rule: Fill,
         transform: Affine,
         brush: &fixed::Brush,
         shape: &impl Shape,
@@ -196,8 +197,7 @@ impl RenderSink for PickingScene<'_> {
         if let Some(stroke) = stroke {
             self.scene.stroke(stroke, transform, brush, None, shape);
         } else {
-            self.scene
-                .fill(Fill::NonZero, transform, brush, None, shape);
+            self.scene.fill(fill_rule, transform, brush, None, shape);
         }
     }
 

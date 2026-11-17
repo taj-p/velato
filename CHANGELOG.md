@@ -35,6 +35,7 @@ This release has an [MSRV][] of 1.88.
 - Position keyframes now retain spatial tangents (`ti`, `to`) and follow curved motion paths using temporally eased arc length. ([#120][] by [@RobertBrewitz])
 - Renamed `Layer::mask_layer` to `matte` and `Layer::is_mask` to `is_matte_source` to distinguish track mattes from path masks in accordance with lottie spec layers docs. ([#125][] by [@RobertBrewitz][])
 - Parent and matte references now use `LayerReference`. ([#125][] by [@RobertBrewitz][])
+- `RenderSink::draw` takes a new `fill_rule` argument after `stroke`, and `model::Draw` has a new `fill_rule` field. Sinks should fill with that rule when `stroke` is `None`.
 - Layers of an unsupported type, such as text, and layers without a type no longer fail the import. They are imported as empty layers that keep their index, parent, transform and matte settings, and are listed in `Composition::unsupported_layers`. Sound and data source assets no longer fail the import either and are listed in `Composition::unsupported_assets`.
 - The schema enums `AnyLayer` and `AnyAsset` have a new `Unknown` variant that holds such a layer or asset as raw JSON.
 - Layers with zero opacity are skipped, along with their `begin_layer_group` and `end_layer_group` calls, and rendering with an `alpha` of zero emits nothing.
@@ -51,6 +52,7 @@ This release has an [MSRV][] of 1.88.
 - Opacity now applies to a layer, precomposition, shape group or repeater copy as a whole, and the `alpha` passed to the renderer to the whole animation. Content with more than one draw call is rendered into a layer first, so overlapping shapes no longer show through each other; a single draw call still takes the opacity in its brush.
 - Import no longer panics on split rotations, split positions in group transforms, easing handles with several or no values, or the `Add` and `HardMix` blend modes. A split rotation uses its Z component and an easing handle its first value.
 - Rendering no longer panics on a polystar point count or repeater copy count too large to hold in memory, which now draw nothing, or on trim paths and spatial position keyframes over extremely long curves.
+- Fills and gradient fills with the even-odd fill rule (`r: 2`) are now filled with it. They were always filled with the non-zero rule.
 - 3D layers are now rotated by their rotation about the Z axis (`rz`). The rotation keys of a 3D layer (`rx`, `ry`, `rz`, `or`) were not read at all, so such a layer was not rotated. Rotation about the X and Y axes and the orientation are still ignored.
 - Hidden shapes (`hd`) are no longer rendered: hidden geometry and hidden styles draw nothing, a hidden group is left out with its content, and a hidden trim path is not applied, as hidden repeaters already were not. For groups, trim paths and repeaters this follows the Lottie specification; lottie-web 5.7.14 ignores `hd` on them. Hidden geometry, styles and groups stay in the model as `Shape::Hidden`, so `EvaluatedLayer::evaluated_paths()` and `authored_paths()` still include them.
 - Gradient fills and gradient strokes now apply their opacity (`o`).

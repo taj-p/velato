@@ -24,7 +24,7 @@ use crate::schema::helpers::transform::{AnyTransformP, AnyTransformR};
 use crate::schema::{helpers::int_boolean::BoolInt, layers::AnyLayer};
 use crate::{Composition, schema};
 use kurbo::{Cap, Join, Point, Size, Vec2};
-use peniko::{BlendMode, Color, Compose, Mix};
+use peniko::{BlendMode, Color, Compose, Fill, Mix};
 use std::collections::HashMap;
 
 /// Converts the layers of the main composition, or of the precomposition asset `asset`.
@@ -281,6 +281,7 @@ fn conv_solid(solid: &schema::layers::solid::SolidLayer) -> Vec<model::Shape> {
             stroke: None,
             brush: model::Brush::Fixed(color.into()),
             opacity: Value::Fixed(100.0),
+            fill_rule: Fill::NonZero,
         }),
     ]
 }
@@ -673,6 +674,14 @@ fn conv_gradient_colors(
     }
 }
 
+fn conv_fill_rule(rule: Option<&schema::constants::fill_rule::FillRule>) -> Fill {
+    use schema::constants::fill_rule::FillRule;
+    match rule {
+        Some(FillRule::EvenOdd) => Fill::EvenOdd,
+        Some(FillRule::NonZero) | None => Fill::NonZero,
+    }
+}
+
 fn conv_draw(value: &schema::shapes::AnyShape) -> Option<runtime::model::Draw> {
     use schema::constants::line_cap::LineCap;
     use schema::constants::line_join::LineJoin;
@@ -687,6 +696,7 @@ fn conv_draw(value: &schema::shapes::AnyShape) -> Option<runtime::model::Draw> {
                 stroke: None,
                 brush,
                 opacity,
+                fill_rule: conv_fill_rule(value.fill_rule.as_ref()),
             })
         }
         AnyShape::Stroke(value) => {
@@ -721,6 +731,7 @@ fn conv_draw(value: &schema::shapes::AnyShape) -> Option<runtime::model::Draw> {
                 stroke: Some(stroke.into_model()),
                 brush,
                 opacity,
+                fill_rule: Fill::NonZero,
             })
         }
         AnyShape::GradientFill(value) => {
@@ -738,6 +749,7 @@ fn conv_draw(value: &schema::shapes::AnyShape) -> Option<runtime::model::Draw> {
                 stroke: None,
                 brush,
                 opacity: conv_scalar(&value.shape_style.opacity),
+                fill_rule: conv_fill_rule(value.fill_rule.as_ref()),
             })
         }
         AnyShape::GradientStroke(value) => {
@@ -786,6 +798,7 @@ fn conv_draw(value: &schema::shapes::AnyShape) -> Option<runtime::model::Draw> {
                 stroke: Some(stroke.into_model()),
                 brush,
                 opacity: conv_scalar(&value.shape_style.opacity),
+                fill_rule: Fill::NonZero,
             })
         }
         _ => None,
@@ -2038,6 +2051,7 @@ mod tests {
             render(&composition, 0.0, 1.0)[2],
             Event::Draw {
                 stroked: false,
+                fill_rule: peniko::Fill::NonZero,
                 alpha: 1.0,
                 bounds: kurbo::Rect::new(0.0, 0.0, 40.0, 30.0),
             }
@@ -2242,6 +2256,7 @@ mod tests {
         let events = render(&composition, 0.0, 1.0);
         assert!(events.contains(&Event::Draw {
             stroked: false,
+            fill_rule: peniko::Fill::NonZero,
             alpha: 1.0,
             bounds: kurbo::Rect::new(110.0, 220.0, 120.0, 230.0),
         }));
