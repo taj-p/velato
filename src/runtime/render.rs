@@ -438,7 +438,7 @@ impl DrawData {
     /// Whether the path of this style holds the geometry.
     fn includes(&self, geometry: &GeometryData) -> bool {
         let even_odd_fill = self.stroke.is_none() && self.fill_rule == Fill::EvenOdd;
-        !(even_odd_fill && geometry.repeated_source)
+        !(geometry.hidden || (even_odd_fill && geometry.repeated_source))
     }
 
     fn new(draw: &Draw, geometry: Range<usize>, frame: f64) -> Self {
@@ -468,6 +468,8 @@ struct GeometryData {
     /// such a path into a later style twice, which makes no difference to a stroke or a
     /// non-zero fill, and cancels it in an even-odd fill.
     repeated_source: bool,
+    /// Geometry that is hidden, or in a hidden group. No style draws it.
+    hidden: bool,
 }
 
 /// A shape group or repeater copy whose opacity applies to its content as a whole.
@@ -496,7 +498,7 @@ pub(crate) fn evaluate_paths(
     frame: f64,
 ) -> Vec<kurbo::BezPath> {
     let mut batch = Batch::default();
-    batch.evaluate_shapes(shapes, transform, frame, false);
+    batch.evaluate_shapes(shapes, transform, frame, false, false);
     batch
         .geometries
         .iter()
@@ -513,7 +515,7 @@ pub(crate) fn evaluate_paths(
 impl Batch {
     /// Evaluates the shapes of a layer and works out the draw calls they need.
     fn evaluate(&mut self, shapes: &[Shape], transform: Affine, frame: f64) {
-        self.evaluate_shapes(shapes, transform, frame, true);
+        self.evaluate_shapes(shapes, transform, frame, true, false);
         self.collect_calls();
     }
 
@@ -523,16 +525,18 @@ impl Batch {
         transform: Affine,
         frame: f64,
         collect_draws: bool,
+        hidden: bool,
     ) {
         let geometry_start = self.geometries.len();
         let draw_start = self.draws.len();
         for shape in shapes {
-            // A hidden shape is not drawn, but its paths are part of the layer's paths.
-            let shape = match shape {
-                Shape::Hidden(_) if collect_draws => continue,
-                Shape::Hidden(shape) => shape.as_ref(),
-                shape => shape,
+            // A hidden shape is not drawn. Its geometry is still evaluated: it is part of the
+            // layer's paths, and it takes its share of a trim that also covers visible paths.
+            let (shape, hidden) = match shape {
+                Shape::Hidden(shape) => (shape.as_ref(), true),
+                shape => (shape, hidden),
             };
+            let collect_draws = collect_draws && !hidden;
             match shape {
                 // Nothing wraps a hidden shape a second time.
                 Shape::Hidden(_) => {}
@@ -551,7 +555,7 @@ impl Batch {
                             (Affine::IDENTITY, 1.0)
                         };
                     let group_draws = self.draws.len();
-                    self.evaluate_shapes(shapes, group_transform, frame, collect_draws);
+                    self.evaluate_shapes(shapes, group_transform, frame, collect_draws, hidden);
                     if group_alpha != 1.0 {
                         let scope = OpacityScope {
                             id: self.next_scope,
@@ -564,7 +568,7 @@ impl Batch {
                     }
                 }
                 Shape::Geometry(geometry) => {
-                    self.push_geometry(geometry, Affine::IDENTITY, frame);
+                    self.push_geometry(geometry, Affine::IDENTITY, frame, hidden);
                 }
                 Shape::Draw(draw) => {
                     if collect_draws {
@@ -589,7 +593,7 @@ impl Batch {
         }
     }
 
-    fn push_geometry(&mut self, geometry: &Geometry, transform: Affine, frame: f64) {
+    fn push_geometry(&mut self, geometry: &Geometry, transform: Affine, frame: f64, hidden: bool) {
         let start = self.elements.len();
         geometry.evaluate(frame, &mut self.elements);
         let end = self.elements.len();
@@ -598,6 +602,7 @@ impl Batch {
             transform,
             trim_order: self.geometries.len(),
             repeated_source: false,
+            hidden,
         });
     }
 
@@ -2178,6 +2183,48 @@ mod tests {
         // Hidden shapes keep their place among the shapes of the layer.
         let indices: Vec<_> = authored.iter().map(|path| path.indices.clone()).collect();
         assert_eq!(indices, [vec![0], vec![1, 0], vec![3]]);
+    }
+
+    #[test]
+    fn hidden_geometry_takes_its_share_of_a_sequential_trim() {
+        use kurbo::Shape as _;
+        let trim = json!({
+            "ty": "tm",
+            "s": { "a": 0, "k": 0 },
+            "e": { "a": 0, "k": 50 },
+            "o": { "a": 0, "k": 0 },
+            "m": 2,
+        });
+        let first = || rect(0.0, 0.0, 10.0, 10.0);
+        let second = || rect(20.0, 0.0, 30.0, 10.0);
+        let layer = |first: serde_json::Value, second: serde_json::Value| {
+            composition(json!([shape_layer(
+                1,
+                json!([first, second, stroke(100.0), trim.clone()])
+            )]))
+        };
+        let drawn = |composition: &crate::Composition| draw_bounds(&render(composition, 0.0, 1.0));
+        let queried = |composition: &crate::Composition| -> Vec<Rect> {
+            let evaluated = composition.evaluate(0.0).unwrap();
+            let paths = evaluated.layers[0].evaluated_paths();
+            paths.iter().map(|path| path.bounding_box()).collect()
+        };
+
+        // Half of the two squares is the first square.
+        let both = layer(first(), second());
+        assert_eq!(drawn(&both), [Rect::new(0.0, 0.0, 10.0, 10.0)]);
+        assert_eq!(queried(&both), [Rect::new(0.0, 0.0, 10.0, 10.0)]);
+
+        // A hidden first square still takes that half, so nothing is left to draw. The query
+        // returns the hidden square, and of the visible one what is drawn: nothing.
+        let first_hidden = layer(hidden(first()), second());
+        assert_eq!(drawn(&first_hidden), []);
+        assert_eq!(queried(&first_hidden), [Rect::new(0.0, 0.0, 10.0, 10.0)]);
+
+        // A hidden second square leaves the first whole, as it would if it were shown.
+        let second_hidden = layer(first(), hidden(second()));
+        assert_eq!(drawn(&second_hidden), [Rect::new(0.0, 0.0, 10.0, 10.0)]);
+        assert_eq!(queried(&second_hidden), [Rect::new(0.0, 0.0, 10.0, 10.0)]);
     }
 
     #[test]

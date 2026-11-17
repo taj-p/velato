@@ -77,6 +77,9 @@ impl EvaluatedLayer<'_> {
     /// Coordinates are pixels in the main animation. Hidden and transparent paths are included,
     /// but colors, stroke thickness, masks, and effects are not applied.
     ///
+    /// The visible paths are the ones that are drawn. A trim that covers hidden paths as well
+    /// gives them their share of its range, here and when rendering.
+    ///
     /// Returns nothing for non-shape layers; for nested animations, query their child layers.
     pub fn evaluated_paths(&self) -> Vec<kurbo::BezPath> {
         match &self.layer.content {
