@@ -90,6 +90,9 @@ pub mod schema;
 mod error;
 pub use error::Error;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 // Re-export vello
 #[cfg(feature = "vello")]
 pub use vello;

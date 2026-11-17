@@ -662,3 +662,190 @@ impl Batch {
         self.trim_elements.clear();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::test_support::*;
+    use kurbo::Rect;
+    use peniko::{BlendMode, Compose, Mix};
+    use serde_json::json;
+
+    #[test]
+    fn layers_paint_bottom_to_top_inside_the_composition_clip() {
+        let composition = composition(json!([
+            shape_layer(1, json!([rect(0.0, 0.0, 10.0, 10.0), fill(100.0)])),
+            shape_layer(2, json!([rect(50.0, 50.0, 60.0, 60.0), fill(100.0)])),
+        ]));
+        let draw = |bounds| Event::Draw {
+            stroked: false,
+            alpha: 1.0,
+            bounds,
+        };
+        assert_eq!(
+            render(&composition, 0.0, 1.0),
+            [
+                Event::PushClip(Rect::new(0.0, 0.0, 100.0, 100.0)),
+                Event::BeginLayer("layer 2".into()),
+                draw(Rect::new(50.0, 50.0, 60.0, 60.0)),
+                Event::EndLayer,
+                Event::BeginLayer("layer 1".into()),
+                draw(Rect::new(0.0, 0.0, 10.0, 10.0)),
+                Event::EndLayer,
+                Event::Pop,
+            ]
+        );
+    }
+
+    #[test]
+    fn styles_paint_in_reverse_order_with_their_own_opacity() {
+        let composition = composition(json!([shape_layer(
+            1,
+            json!([rect(0.0, 0.0, 10.0, 10.0), fill(40.0), stroke(100.0)]),
+        )]));
+        assert_eq!(
+            trace(&composition, 0.0),
+            ["clip", "stroke(1)", "fill(0.4)", "pop"]
+        );
+    }
+
+    #[test]
+    fn hidden_and_inactive_layers_emit_nothing() {
+        let shapes = || json!([rect(0.0, 0.0, 10.0, 10.0), fill(100.0)]);
+        let composition = composition(json!([
+            with(shape_layer(1, shapes()), json!({ "hd": true })),
+            with(shape_layer(2, shapes()), json!({ "ip": 10, "op": 20 })),
+        ]));
+        assert_eq!(render(&composition, 0.0, 1.0).len(), 2);
+        assert_eq!(trace(&composition, 0.0), ["clip", "pop"]);
+        assert_eq!(trace(&composition, 10.0), ["clip", "fill(1)", "pop"]);
+        assert_eq!(trace(&composition, 20.0), ["clip", "pop"]);
+    }
+
+    /// A document without translucent layers, groups or repeater copies. It covers parenting, a
+    /// group, a track matte, a mask, a precomposition, a repeater and an image.
+    fn opaque_document() -> crate::Composition {
+        let mask_path = json!({
+            "a": 0,
+            "k": {
+                "c": true,
+                "v": [[0, 0], [40, 0], [40, 40], [0, 40]],
+                "i": [[0, 0], [0, 0], [0, 0], [0, 0]],
+                "o": [[0, 0], [0, 0], [0, 0], [0, 0]],
+            },
+        });
+        composition_with_assets(
+            json!([
+                { "id": "image", "w": 8, "h": 8, "u": "", "p": "image.png", "e": 0 },
+                precomp(
+                    "comp",
+                    json!([shape_layer(
+                        1,
+                        json!([
+                            rect(0.0, 0.0, 10.0, 10.0),
+                            fill(100.0),
+                            repeater(2, 20.0, 100.0, 100.0),
+                        ]),
+                    )]),
+                ),
+            ]),
+            json!([
+                with(
+                    shape_layer(
+                        1,
+                        json!([group(
+                            vec![rect(10.0, 10.0, 30.0, 30.0), fill(100.0), stroke(50.0)],
+                            100.0,
+                        )]),
+                    ),
+                    json!({ "parent": 6 }),
+                ),
+                with(
+                    shape_layer(2, json!([rect(0.0, 0.0, 50.0, 50.0), fill(100.0)])),
+                    json!({ "td": 1 }),
+                ),
+                with(
+                    shape_layer(3, json!([rect(25.0, 25.0, 75.0, 75.0), fill(100.0)])),
+                    json!({ "tt": 1 }),
+                ),
+                with(
+                    precomp_layer(4, "comp"),
+                    json!({
+                        "masksProperties": [
+                            { "mode": "a", "pt": mask_path, "o": { "a": 0, "k": 100 } },
+                        ],
+                    }),
+                ),
+                with(layer(2, 5), json!({ "refId": "image" })),
+                with(
+                    layer(3, 6),
+                    json!({
+                        "ks": with(transform(100.0), json!({ "p": { "a": 0, "k": [5, 5] } })),
+                    }),
+                ),
+            ]),
+        )
+    }
+
+    // Pins the complete sequence for a document that needs no opacity compositing, so that
+    // changes to how opacity is composited cannot alter what such documents emit.
+    #[test]
+    fn opaque_document_emits_a_fixed_sequence() {
+        let full = Rect::new(0.0, 0.0, 100.0, 100.0);
+        let begin = |index: u32| Event::BeginLayer(format!("layer {index}"));
+        let draw = |stroked, alpha, bounds| Event::Draw {
+            stroked,
+            alpha,
+            bounds,
+        };
+        let layer = |blend: BlendMode| Event::PushLayer {
+            blend,
+            alpha: 1.0,
+            bounds: full,
+        };
+        assert_eq!(
+            render(&opaque_document(), 0.0, 1.0),
+            [
+                Event::PushClip(full),
+                // The null layer draws nothing.
+                begin(6),
+                Event::EndLayer,
+                // The image is clipped to its authored size.
+                begin(5),
+                Event::PushClip(Rect::new(0.0, 0.0, 8.0, 8.0)),
+                Event::Image {
+                    id: "image".into(),
+                    alpha: 1.0,
+                },
+                Event::Pop,
+                Event::EndLayer,
+                // The mask clips the precomposition, whose repeater paints later copies first.
+                begin(4),
+                Event::PushClip(Rect::new(0.0, 0.0, 40.0, 40.0)),
+                begin(1),
+                draw(false, 1.0, Rect::new(20.0, 0.0, 30.0, 10.0)),
+                draw(false, 1.0, Rect::new(0.0, 0.0, 10.0, 10.0)),
+                Event::EndLayer,
+                Event::Pop,
+                Event::EndLayer,
+                // The matte source renders into its own layer and the matted layer keeps only
+                // what falls inside it.
+                begin(3),
+                layer(Mix::Normal.into()),
+                begin(2),
+                draw(false, 1.0, Rect::new(0.0, 0.0, 50.0, 50.0)),
+                Event::EndLayer,
+                layer(Compose::SrcIn.into()),
+                draw(false, 1.0, Rect::new(25.0, 25.0, 75.0, 75.0)),
+                Event::Pop,
+                Event::Pop,
+                Event::EndLayer,
+                // The parent null offsets the group; the stroke is listed last so it paints first.
+                begin(1),
+                draw(true, 0.5, Rect::new(15.0, 15.0, 35.0, 35.0)),
+                draw(false, 1.0, Rect::new(15.0, 15.0, 35.0, 35.0)),
+                Event::EndLayer,
+                Event::Pop,
+            ]
+        );
+    }
+}
