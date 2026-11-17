@@ -889,9 +889,15 @@ impl Batch {
                 RepeaterComposite::Above => copy,
             };
             let transform = repeater.transform(i);
+            // A sequential trim takes the copies in the order they are stacked in, like the
+            // opacity of the repeater.
+            let step = match repeater.composite {
+                RepeaterComposite::Below => i,
+                RepeaterComposite::Above => repeater.copies - 1 - i,
+            };
             for geometry in &self.repeat_geometries {
                 let mut geometry = geometry.clone();
-                geometry.trim_order += i * geometry_count;
+                geometry.trim_order += step * geometry_count;
                 geometry.transform = transform * geometry.transform;
                 geometry.repeated_source = false;
                 self.geometries.push(geometry);
@@ -1929,6 +1935,38 @@ mod tests {
         assert_eq!(alphas_by_position(1), [(0.0, 1.0), (30.0, 0.5)]);
         // With the copies stacked the other way, the opacity runs the other way too.
         assert_eq!(alphas_by_position(2), [(30.0, 0.5), (60.0, 1.0)]);
+    }
+
+    #[test]
+    fn sequential_trim_after_a_repeater_takes_the_copies_in_stacking_order() {
+        // Three copies, 30 units apart, and a trim that keeps the first half of their length
+        // and of the source: the first two copies it comes to.
+        let kept = |composite: u8| {
+            let trim = json!({
+                "ty": "tm",
+                "s": { "a": 0, "k": 0 },
+                "e": { "a": 0, "k": 50 },
+                "o": { "a": 0, "k": 0 },
+                "m": 2,
+            });
+            let shapes = json!([
+                rect(0.0, 0.0, 10.0, 10.0),
+                stroke(100.0),
+                with(repeater(3, 30.0, 100.0, 100.0), json!({ "m": composite })),
+                trim,
+            ]);
+            let events = render(&composition(json!([shape_layer(1, shapes)])), 0.0, 1.0);
+            let mut starts: Vec<_> = draw_bounds(&events)
+                .iter()
+                .map(|bounds| bounds.x0)
+                .collect();
+            starts.sort_by(f64::total_cmp);
+            starts
+        };
+        assert_eq!(kept(1), [0.0, 30.0]);
+        // With the copies stacked the other way, the trim starts at the copy that is moved
+        // furthest.
+        assert_eq!(kept(2), [30.0, 60.0]);
     }
 
     #[test]
