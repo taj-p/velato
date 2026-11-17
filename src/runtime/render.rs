@@ -500,12 +500,18 @@ impl Batch {
     }
 
     fn repeat(&mut self, repeater: &fixed::Repeater, geometry_start: usize, draw_start: usize) {
-        if repeater.copies == 0 {
+        // A copy count whose geometry is too large to hold in memory draws nothing, like no copies.
+        let geometry_count = self.geometries.len() - geometry_start;
+        let fits = repeater
+            .copies
+            .checked_mul(geometry_count)
+            .is_some_and(|total| self.geometries.try_reserve(total).is_ok());
+        if repeater.copies == 0 || !fits {
             self.geometries.truncate(geometry_start);
             self.draws.truncate(draw_start);
             return;
         }
-        if geometry_start == self.geometries.len() {
+        if geometry_count == 0 {
             return;
         }
 
@@ -514,7 +520,6 @@ impl Batch {
         self.repeat_geometries
             .extend(self.geometries.drain(geometry_start..));
         self.repeat_draws.extend(self.draws.drain(draw_start..));
-        let geometry_count = self.repeat_geometries.len();
         let start_alpha = repeater.start_opacity / 100.0;
         let end_alpha = repeater.end_opacity / 100.0;
         let delta_alpha = if repeater.copies > 1 {
@@ -1571,5 +1576,52 @@ mod tests {
         );
         assert_eq!(trace(&precomposed, 0.0), expected);
         assert_eq!(trace_with_alpha(&composition(layers()), 0.0, 0.5), expected);
+    }
+
+    #[test]
+    fn repeater_with_too_many_copies_draws_nothing() {
+        let mut too_many = repeater(1, 10.0, 100.0, 100.0);
+        too_many["c"]["k"] = json!(1e30);
+        let shapes = json!([
+            rect(0.0, 0.0, 10.0, 10.0),
+            rect(20.0, 0.0, 30.0, 10.0),
+            fill(100.0),
+            too_many,
+        ]);
+        assert_eq!(
+            trace(&composition(json!([shape_layer(1, shapes)])), 0.0),
+            ["clip", "pop"]
+        );
+    }
+
+    #[test]
+    fn trim_of_an_extremely_long_curve_renders() {
+        let shapes = json!([
+            {
+                "ty": "sh",
+                "ks": {
+                    "a": 0,
+                    "k": {
+                        "c": false,
+                        "v": [[0, 0], [1e25, 0]],
+                        "i": [[0, 0], [0, 1e24]],
+                        "o": [[0, 1e24], [0, 0]],
+                    },
+                },
+            },
+            stroke(100.0),
+            {
+                "ty": "tm",
+                "s": { "a": 0, "k": 25 },
+                "e": { "a": 0, "k": 75 },
+                "o": { "a": 0, "k": 0 },
+                "m": 1,
+            },
+        ]);
+        let events = render(&composition(json!([shape_layer(1, shapes)])), 0.0, 1.0);
+        let Event::Draw { bounds, .. } = &events[2] else {
+            panic!("expected a draw call, got {events:?}");
+        };
+        assert!(bounds.x0 > 1e24 && bounds.x1 < 9e24, "{bounds:?}");
     }
 }

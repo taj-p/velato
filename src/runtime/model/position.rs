@@ -32,6 +32,9 @@ pub struct SpatialPosition {
 impl SpatialPosition {
     const ACCURACY: f64 = 0.01;
     const RELATIVE_ACCURACY: f64 = 1e-5;
+    // Keeps the root finding that inverts an arc length within its iteration budget when a path
+    // is extremely long. It is below `ACCURACY` for any length that occurs in practice.
+    const MIN_RELATIVE_ACCURACY: f64 = 1e-12;
 
     fn is_linear(curve: &CubicBez) -> bool {
         let chord = curve.p3 - curve.p0;
@@ -89,6 +92,7 @@ impl SpatialPosition {
                     + (curve.p3 - curve.p2).hypot();
                 let accuracy = Self::ACCURACY
                     .min(control_length * Self::RELATIVE_ACCURACY)
+                    .max(control_length * Self::MIN_RELATIVE_ACCURACY)
                     .max(f64::MIN_POSITIVE);
                 let arc_length = if curve.is_finite() {
                     curve.arclen(accuracy)

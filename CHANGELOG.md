@@ -44,6 +44,8 @@ This release has an [MSRV][] of 1.88.
 - Reject invalid animation frame rates duriing import ([#121][] by [@RobertBrewitz][])
 - Fixed omitted layer rotation causing panick during import. ([#122][] by [@RobertBrewitz][])
 - Opacity now applies to a layer, precomposition, shape group or repeater copy as a whole, and the `alpha` passed to the renderer to the whole animation. Content with more than one draw call is rendered into a layer first, so overlapping shapes no longer show through each other; a single draw call still takes the opacity in its brush.
+- Import no longer panics on split rotations, split positions in group transforms, easing handles with several or no values, or the `Add` and `HardMix` blend modes. A split rotation uses its Z component and an easing handle its first value.
+- Rendering no longer panics on a polystar point count or repeater copy count too large to hold in memory, which now draw nothing, or on trim paths and spatial position keyframes over extremely long curves.
 - Keyframes without a start value (`s`) now import. Older exporters end each animated property with a keyframe that holds only a time; it takes the previous keyframe's end value (`e`).
 
 ## [0.12.0][] (2026-09-09)

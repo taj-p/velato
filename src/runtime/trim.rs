@@ -4,6 +4,9 @@
 use kurbo::{ParamCurve, ParamCurveArclen, PathEl, segments};
 
 const ACCURACY: f64 = 0.1;
+// Keeps the root finding that inverts an arc length within its iteration budget when a segment
+// is extremely long. Lengths that occur in practice use `ACCURACY` unchanged.
+const RELATIVE_ACCURACY: f64 = 1e-12;
 
 pub(crate) fn length(elements: &[PathEl]) -> f64 {
     segments(elements.iter().copied())
@@ -72,17 +75,18 @@ fn trim_contour(
             }
             let next = position + segment_length;
             if segment_length > 0.0 && next > start && position < end {
+                let accuracy = ACCURACY.max(segment_length * RELATIVE_ACCURACY);
                 let t0 = if start <= position {
                     0.0
                 } else {
                     segment
-                        .inv_arclen(start - position, ACCURACY)
+                        .inv_arclen(start - position, accuracy)
                         .clamp(0.0, 1.0)
                 };
                 let t1 = if end >= next {
                     1.0
                 } else {
-                    segment.inv_arclen(end - position, ACCURACY).clamp(0.0, 1.0)
+                    segment.inv_arclen(end - position, accuracy).clamp(0.0, 1.0)
                 };
                 if t1 > t0 {
                     let sub = segment.subsegment(t0..t1);

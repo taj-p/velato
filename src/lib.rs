@@ -41,8 +41,8 @@
 //! - Advanced shapes (stroke dash, zig-zag, etc.)
 //! - Layer effects other than Gaussian blur, drop shadow, fill, and tint
 //! - Correct color stop handling
-//! - Split rotations
-//! - Split positions
+//! - 3D layers (a rotation split into `x`, `y` and `z` under `r` uses only `z`; the `rx`, `ry`,
+//!   `rz` and `or` keys are ignored)
 
 // LINEBENDER LINT SET - lib.rs - v4
 // See https://linebender.org/wiki/canonical-lints/

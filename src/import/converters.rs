@@ -18,7 +18,9 @@ use crate::schema::animated_properties::keyframe_bezier_handle::{
 };
 use crate::schema::animated_properties::multi_dimensional::MultiDimensional;
 use crate::schema::animated_properties::split_vector::SplitVector;
+use crate::schema::animated_properties::value::FloatValue;
 use crate::schema::constants::gradient_type::GradientType;
+use crate::schema::helpers::transform::{AnyTransformP, AnyTransformR};
 use crate::schema::{helpers::int_boolean::BoolInt, layers::AnyLayer};
 use crate::{Composition, schema};
 use kurbo::{Cap, Join, Point, Size, Vec2};
@@ -262,30 +264,35 @@ fn is_layer_hidden(source: &AnyLayer) -> bool {
     hidden == Some(true)
 }
 
+/// Returns the rotation in the plane of the composition.
+///
+/// A split rotation also turns the layer about the X and Y axes, which a 2D transform cannot
+/// express, so only its Z component is used.
+fn transform_rotation(rotation: &Option<AnyTransformR>) -> &FloatValue {
+    match rotation {
+        Some(AnyTransformR::Rotation(value)) => value,
+        Some(AnyTransformR::SplitRotation { z_rotation, .. }) => z_rotation,
+        None => &FLOAT_VALUE_ZERO,
+    }
+}
+
+fn conv_transform_position(position: &AnyTransformP) -> Position {
+    match position {
+        AnyTransformP::Position(position) => conv_pos_point(position),
+        AnyTransformP::SplitPosition(SplitVector { x, y, .. }) => {
+            Position::SplitValues((conv_scalar(x), conv_scalar(y)))
+        }
+    }
+}
+
 pub fn conv_transform(
     value: &schema::helpers::transform::Transform,
 ) -> (runtime::model::Transform, Value<f64>) {
-    let rotation_in = match &value.rotation {
-        Some(any_trans) => match any_trans {
-            schema::helpers::transform::AnyTransformR::Rotation(float_value) => float_value,
-            // todo: need to actually handle split rotations
-            schema::helpers::transform::AnyTransformR::SplitRotation { .. } => todo!(),
-        },
-        None => &FLOAT_VALUE_ZERO,
-    };
-
-    let position = match &value.position {
-        schema::helpers::transform::AnyTransformP::Position(position) => conv_pos_point(position),
-        schema::helpers::transform::AnyTransformP::SplitPosition(SplitVector { x, y, .. }) => {
-            Position::SplitValues((conv_scalar(x), conv_scalar(y)))
-        }
-    };
-
     let transform = animated::Transform {
         anchor: conv_pos_point(value.anchor_point.as_ref().unwrap_or(&POSITION_ZERO)),
-        position,
+        position: conv_transform_position(&value.position),
         scale: conv_vec2(value.scale.as_ref().unwrap_or(&MULTIDIM_ONE_HUNDRED)),
-        rotation: conv_scalar(rotation_in),
+        rotation: conv_scalar(transform_rotation(&value.rotation)),
         skew: conv_scalar(value.skew.as_ref().unwrap_or(&FLOAT_VALUE_ZERO)),
         skew_angle: conv_scalar(value.skew_axis.as_ref().unwrap_or(&FLOAT_VALUE_ZERO)),
     };
@@ -294,24 +301,6 @@ pub fn conv_transform(
 }
 
 pub fn conv_shape_transform(value: &schema::shapes::transform::TransformShape) -> GroupTransform {
-    let rotation_in = match &value.transform.rotation {
-        Some(any_trans) => match any_trans {
-            schema::helpers::transform::AnyTransformR::Rotation(float_value) => float_value,
-            // todo: need to actually handle split rotations
-            schema::helpers::transform::AnyTransformR::SplitRotation { .. } => {
-                todo!("split rotation")
-            }
-        },
-        None => &FLOAT_VALUE_ZERO,
-    };
-    let position_in = match &value.transform.position {
-        schema::helpers::transform::AnyTransformP::Position(position) => position,
-        schema::helpers::transform::AnyTransformP::SplitPosition(_) => {
-            // todo: split vectors
-            todo!("split position");
-        }
-    };
-
     let transform = animated::Transform {
         anchor: conv_pos_point(
             value
@@ -320,7 +309,7 @@ pub fn conv_shape_transform(value: &schema::shapes::transform::TransformShape) -
                 .as_ref()
                 .unwrap_or(&POSITION_ZERO),
         ),
-        position: conv_pos_point(position_in),
+        position: conv_transform_position(&value.transform.position),
         scale: conv_vec2(
             value
                 .transform
@@ -328,7 +317,7 @@ pub fn conv_shape_transform(value: &schema::shapes::transform::TransformShape) -
                 .as_ref()
                 .unwrap_or(&MULTIDIM_ONE_HUNDRED),
         ),
-        rotation: conv_scalar(rotation_in),
+        rotation: conv_scalar(transform_rotation(&value.transform.rotation)),
         skew: conv_scalar(value.transform.skew.as_ref().unwrap_or(&FLOAT_VALUE_ZERO)),
         skew_angle: conv_scalar(
             value
@@ -447,26 +436,21 @@ pub fn conv_keyframes<'a, T: Tween>(
     })
 }
 
-fn conv_keyframe_handle(handle: &KeyframeBezierHandle) -> EasingHandle {
-    let KeyframeBezierHandle {
-        x_coordinate,
-        y_coordinate,
-    } = handle;
-    let x = match x_coordinate {
-        KeyframeComponent::ArrayOfValues(arr) => {
-            assert!(arr.len() == 1, "{arr:?}");
-            arr[0]
+/// Converts an easing handle of a property that is eased as a whole.
+///
+/// A handle may hold one value per dimension. The first is used, and a handle without values
+/// counts as missing.
+fn conv_keyframe_handle(handle: &KeyframeBezierHandle) -> Option<EasingHandle> {
+    fn first(component: &KeyframeComponent) -> Option<f64> {
+        match component {
+            KeyframeComponent::SingleValue(value) => Some(*value),
+            KeyframeComponent::ArrayOfValues(values) => values.first().copied(),
         }
-        KeyframeComponent::SingleValue(v) => *v,
-    };
-    let y = match y_coordinate {
-        KeyframeComponent::ArrayOfValues(arr) => {
-            assert!(arr.len() == 1);
-            arr[0]
-        }
-        KeyframeComponent::SingleValue(v) => *v,
-    };
-    EasingHandle { x, y }
+    }
+    Some(EasingHandle {
+        x: first(&handle.x_coordinate)?,
+        y: first(&handle.y_coordinate)?,
+    })
 }
 
 fn conv_gradient_colors(
@@ -507,8 +491,16 @@ fn conv_gradient_colors(
                     .unwrap_or(false);
                 frames.push(Time {
                     frame: value.base.time,
-                    in_tangent: value.base.in_tangent.as_ref().map(conv_keyframe_handle),
-                    out_tangent: value.base.out_tangent.as_ref().map(conv_keyframe_handle),
+                    in_tangent: value
+                        .base
+                        .in_tangent
+                        .as_ref()
+                        .and_then(conv_keyframe_handle),
+                    out_tangent: value
+                        .base
+                        .out_tangent
+                        .as_ref()
+                        .and_then(conv_keyframe_handle),
                     hold,
                 });
 
@@ -683,35 +675,20 @@ fn conv_shape(value: &schema::shapes::AnyShape) -> Option<crate::runtime::model:
         }
         schema::shapes::AnyShape::Repeater(value) => {
             use schema::constants::composite::Composite;
-            use schema::helpers::transform::{AnyTransformP, AnyTransformR};
 
             if value.modifier.graphic_element.hidden == Some(true) {
                 return None;
             }
 
             let transform = &value.transform.transform.transform;
-            let position = match &transform.position {
-                AnyTransformP::Position(position) => conv_pos_point(position),
-                AnyTransformP::SplitPosition(SplitVector { x, y, .. }) => {
-                    Position::SplitValues((conv_scalar(x), conv_scalar(y)))
-                }
-            };
-            let rotation = transform
-                .rotation
-                .as_ref()
-                .map(|rotation| match rotation {
-                    AnyTransformR::Rotation(value) => value,
-                    AnyTransformR::SplitRotation { z_rotation, .. } => z_rotation,
-                })
-                .unwrap_or(&FLOAT_VALUE_ZERO);
             let repeater = animated::Repeater {
                 copies: conv_scalar(&value.copies),
                 offset: conv_scalar(value.offset.as_ref().unwrap_or(&FLOAT_VALUE_ZERO)),
                 anchor_point: conv_pos_point(
                     transform.anchor_point.as_ref().unwrap_or(&POSITION_ZERO),
                 ),
-                position,
-                rotation: conv_scalar(rotation),
+                position: conv_transform_position(&transform.position),
+                rotation: conv_scalar(transform_rotation(&transform.rotation)),
                 scale: conv_vec2(transform.scale.as_ref().unwrap_or(&MULTIDIM_ONE_HUNDRED)),
                 start_opacity: conv_scalar(
                     value
@@ -856,8 +833,16 @@ pub fn conv_shape_geometry(
                 // Add frame time and easing
                 frames.push(Time {
                     frame: value.base.time,
-                    in_tangent: value.base.in_tangent.as_ref().map(conv_keyframe_handle),
-                    out_tangent: value.base.out_tangent.as_ref().map(conv_keyframe_handle),
+                    in_tangent: value
+                        .base
+                        .in_tangent
+                        .as_ref()
+                        .and_then(conv_keyframe_handle),
+                    out_tangent: value
+                        .base
+                        .out_tangent
+                        .as_ref()
+                        .and_then(conv_keyframe_handle),
                     hold,
                 });
                 // Get converted spline points for keyframe bezier at the start
@@ -865,8 +850,9 @@ pub fn conv_shape_geometry(
                     if let Some(start) = &value.start {
                         start.first()?.clone()
                     } else {
-                        // No keyframe was present - we look for the previous end/start
-                        let prev = animated.get(idx - 1)?;
+                        // No keyframe was present - we look for the previous end/start. Without
+                        // either, the path has no geometry.
+                        let prev = animated.get(idx.checked_sub(1)?)?;
                         // Take the previous end if present, otherwise the previous start.
                         if let Some(prev_end) = prev.end.as_ref() {
                             if let Some(prev_end_bezier) = prev_end.first() {
@@ -943,8 +929,8 @@ pub fn conv_blend_mode(
         Saturation => BlendMode::from(Mix::Saturation),
         Color => BlendMode::from(Mix::Color),
         Luminosity => BlendMode::from(Mix::Luminosity),
-        Add => unimplemented!(),
-        HardMix => unimplemented!(),
+        // Not yet mapped to a blend mode; the layer blends normally.
+        Add | HardMix => return None,
     })
 }
 
@@ -966,8 +952,16 @@ pub fn conv_scalar(float_value: &schema::animated_properties::value::FloatValue)
                     .unwrap_or(false);
                 frames.push(crate::runtime::model::Time {
                     frame: start_time,
-                    in_tangent: keyframe.base.in_tangent.as_ref().map(conv_keyframe_handle),
-                    out_tangent: keyframe.base.out_tangent.as_ref().map(conv_keyframe_handle),
+                    in_tangent: keyframe
+                        .base
+                        .in_tangent
+                        .as_ref()
+                        .and_then(conv_keyframe_handle),
+                    out_tangent: keyframe
+                        .base
+                        .out_tangent
+                        .as_ref()
+                        .and_then(conv_keyframe_handle),
                     hold,
                 });
                 values.push(data);
@@ -1014,20 +1008,6 @@ pub fn conv_pos_point(value: &schema::animated_properties::position::Position) -
         }
     }
 
-    fn temporal_handle(handle: &KeyframeBezierHandle) -> Option<EasingHandle> {
-        // use the first easing component for distance along the spatial path
-        fn first(component: &KeyframeComponent) -> Option<f64> {
-            match component {
-                KeyframeComponent::SingleValue(value) => Some(*value),
-                KeyframeComponent::ArrayOfValues(values) => values.first().copied(),
-            }
-        }
-        Some(EasingHandle {
-            x: first(&handle.x_coordinate)?,
-            y: first(&handle.y_coordinate)?,
-        })
-    }
-
     match &value.value {
         Static(components) => Position::Value(Value::Fixed(point(components))),
         Animated(keyframes)
@@ -1044,8 +1024,9 @@ pub fn conv_pos_point(value: &schema::animated_properties::position::Position) -
                     SpatialKeyframe {
                         time: Time {
                             frame: base.time,
-                            in_tangent: base.in_tangent.as_ref().and_then(temporal_handle),
-                            out_tangent: base.out_tangent.as_ref().and_then(temporal_handle),
+                            // The first easing component gives the distance along the spatial path.
+                            in_tangent: base.in_tangent.as_ref().and_then(conv_keyframe_handle),
+                            out_tangent: base.out_tangent.as_ref().and_then(conv_keyframe_handle),
                             hold: base.hold == Some(BoolInt::True),
                         },
                         value: point(start_value),
@@ -1511,5 +1492,215 @@ mod tests {
         assert_eq!(bounds(0.0), Some(kurbo::Rect::new(0.0, 0.0, 10.0, 10.0)));
         assert_eq!(bounds(10.0), Some(kurbo::Rect::new(40.0, 0.0, 50.0, 10.0)));
         assert_eq!(trace(&composition, 10.0), ["clip", "fill(0.5)", "pop"]);
+    }
+
+    fn split_rotation(z: f64) -> serde_json::Value {
+        json!({
+            "x": { "a": 0, "k": 10 },
+            "y": { "a": 0, "k": 20 },
+            "z": { "a": 0, "k": z },
+            "or": { "a": 0, "k": [0, 0, 0] },
+        })
+    }
+
+    #[test]
+    fn layer_split_rotation_uses_the_z_component() {
+        use crate::test_support::*;
+        let ks = with(transform(100.0), json!({ "r": split_rotation(90.0) }));
+        let composition = composition(json!([with(layer(3, 1), json!({ "ks": ks }))]));
+        let components = composition.layers[0].transform.components(0.0).unwrap();
+        assert_eq!(components.rotation, 90.0);
+    }
+
+    #[test]
+    fn group_transform_accepts_split_rotation_and_split_position() {
+        use crate::test_support::*;
+        let mut group = group(vec![rect(0.0, 0.0, 10.0, 10.0), fill(100.0)], 100.0);
+        group["it"][2]["r"] = split_rotation(90.0);
+        group["it"][2]["p"] = json!({
+            "s": true,
+            "x": { "a": 0, "k": 12 },
+            "y": { "a": 0, "k": 34 },
+        });
+        let Some(model::Shape::Group(_, Some(group))) = conv_shape(&parse(group)) else {
+            panic!("expected a group with a transform");
+        };
+        let components = group.transform.components(0.0).unwrap();
+        assert_eq!(components.rotation, 90.0);
+        assert_eq!(components.position, Point::new(12.0, 34.0));
+    }
+
+    /// Two keyframes from 0 to 100 over ten frames with the given easing handles.
+    fn eased_keyframes(o: serde_json::Value, i: serde_json::Value) -> serde_json::Value {
+        json!({
+            "a": 1,
+            "k": [{ "t": 0, "s": [0], "o": o, "i": i }, { "t": 10, "s": [100] }],
+        })
+    }
+
+    #[test]
+    fn easing_handle_with_several_values_uses_the_first() {
+        let several = super::conv_scalar(&parse(eased_keyframes(
+            json!({ "x": [0.6, 0.1], "y": [0.0, 0.9] }),
+            json!({ "x": [0.4, 0.8], "y": [1.0, 0.2] }),
+        )));
+        let single = super::conv_scalar(&parse(eased_keyframes(
+            json!({ "x": [0.6], "y": [0.0] }),
+            json!({ "x": [0.4], "y": [1.0] }),
+        )));
+        assert_eq!(several.evaluate(3.0), single.evaluate(3.0));
+        assert!(single.evaluate(3.0) < 20.0, "the easing starts slowly");
+    }
+
+    #[test]
+    fn easing_handle_without_values_counts_as_missing() {
+        let value = super::conv_scalar(&parse(eased_keyframes(
+            json!({ "x": [], "y": [] }),
+            json!({ "x": [], "y": [] }),
+        )));
+        assert!(close(value.evaluate(3.0), 30.0));
+    }
+
+    #[test]
+    fn shape_keyframes_accept_easing_handles_with_several_values() {
+        let bezier = |x: f64| {
+            json!([{
+                "c": false,
+                "v": [[0, 0], [x, 0]],
+                "i": [[0, 0], [0, 0]],
+                "o": [[0, 0], [0, 0]],
+            }])
+        };
+        let geometry = super::conv_shape_geometry(&parse(json!({
+            "a": 1,
+            "k": [
+                {
+                    "t": 0,
+                    "s": bezier(10.0),
+                    "o": { "x": [0.0, 0.5], "y": [0.0, 0.5] },
+                    "i": { "x": [1.0, 0.5], "y": [1.0, 0.5] },
+                },
+                { "t": 10, "s": bezier(20.0) },
+            ],
+        })))
+        .unwrap();
+        let mut path = vec![];
+        geometry.evaluate(5.0, &mut path);
+        assert_eq!(
+            path,
+            [
+                kurbo::PathEl::MoveTo(Point::new(0.0, 0.0)),
+                kurbo::PathEl::LineTo(Point::new(15.0, 0.0)),
+            ]
+        );
+    }
+
+    #[test]
+    fn gradient_keyframes_accept_easing_handles_with_several_values() {
+        let stops = super::conv_gradient_colors(&parse(json!({
+            "p": 1,
+            "k": {
+                "a": 1,
+                "k": [
+                    {
+                        "t": 0,
+                        "s": [0, 1, 0, 0],
+                        "o": { "x": [0.0, 0.5], "y": [0.0, 0.5] },
+                        "i": { "x": [1.0, 0.5], "y": [1.0, 0.5] },
+                    },
+                    { "t": 10, "s": [0, 0, 0, 1] },
+                ],
+            },
+        })));
+        let stops = stops.evaluate(5.0);
+        assert_eq!(stops.as_ref()[0].color.components, [0.5, 0.0, 0.5, 1.0]);
+    }
+
+    #[test]
+    fn keyframe_with_empty_value_evaluates_to_zero() {
+        let value = super::conv_scalar(&parse(json!({
+            "a": 1,
+            "k": [{ "t": 0, "s": [] }, { "t": 10, "s": [] }],
+        })));
+        assert_eq!(value.evaluate(5.0), 0.0);
+    }
+
+    #[test]
+    fn add_and_hard_mix_blend_modes_import_as_normal() {
+        use crate::test_support::*;
+        for mode in [16, 17] {
+            let composition = composition(json!([with(layer(3, 1), json!({ "bm": mode }))]));
+            assert_eq!(composition.layers[0].blend_mode, None);
+        }
+    }
+
+    #[test]
+    fn first_shape_keyframe_without_start_has_no_geometry() {
+        use crate::schema::animated_properties::{
+            keyframe_base::KeyframeBase,
+            shape_keyframe::ShapeKeyframe,
+            shape_property::{ShapeProperty, ShapePropertyK},
+        };
+        // Parsing rejects this, but the schema types can be built directly.
+        let keyframe = |time| ShapeKeyframe {
+            base: KeyframeBase {
+                time,
+                hold: None,
+                in_tangent: None,
+                out_tangent: None,
+            },
+            start: None,
+            end: None,
+        };
+        let property = ShapeProperty {
+            property_index: None,
+            animated: None,
+            expression: None,
+            value: ShapePropertyK::Animated(vec![keyframe(0.0), keyframe(10.0)]),
+        };
+        assert!(super::conv_shape_geometry(&property).is_none());
+    }
+
+    fn polystar(star_type: u8, points: serde_json::Value) -> serde_json::Value {
+        json!({
+            "ty": "sr",
+            "sy": star_type,
+            "p": { "a": 0, "k": [50, 50] },
+            "or": { "a": 0, "k": 20 },
+            "os": { "a": 0, "k": 0 },
+            "ir": { "a": 0, "k": 10 },
+            "is": { "a": 0, "k": 0 },
+            "r": { "a": 0, "k": 0 },
+            "pt": points,
+        })
+    }
+
+    #[test]
+    fn polystar_with_too_many_points_has_no_outline() {
+        use crate::test_support::*;
+        let animated = json!({ "a": 1, "k": [{ "t": 0, "s": [1e30] }, { "t": 10, "s": [1e30] }] });
+        for points in [json!({ "a": 0, "k": 1e30 }), animated] {
+            for star_type in [1, 2] {
+                let shapes = json!([polystar(star_type, points.clone()), fill(100.0)]);
+                let composition = composition(json!([shape_layer(1, shapes)]));
+                assert_eq!(trace(&composition, 0.0), ["clip", "pop"]);
+            }
+        }
+        let shapes = json!([polystar(1, json!({ "a": 0, "k": 5 })), fill(100.0)]);
+        let composition = composition(json!([shape_layer(1, shapes)]));
+        assert_eq!(trace(&composition, 0.0), ["clip", "fill(1)", "pop"]);
+    }
+
+    #[test]
+    fn spatial_position_along_an_extremely_long_path_evaluates() {
+        let position = super::conv_pos_point(&parse(json!({
+            "a": 1,
+            "k": [
+                { "t": 0, "s": [0, 0, 0], "to": [0, 1e24, 0], "ti": [0, 1e24, 0] },
+                { "t": 10, "s": [1e25, 0, 0] },
+            ],
+        })));
+        let middle = position.evaluate(5.0);
+        assert!(middle.x > 4e24 && middle.x < 6e24, "{middle:?}");
     }
 }

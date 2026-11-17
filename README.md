@@ -43,8 +43,7 @@ Several Lottie features are not yet supported, including:
 - Advanced shapes (stroke dash, zig-zag, etc.)
 - Layer effects other than Gaussian blur, drop shadow, fill, and tint (these require sink support; the built-in Vello sinks skip them)
 - Correct color stop handling
-- Split rotations
-- Split positions
+- 3D layers (a rotation split into `x`, `y` and `z` under `r` uses only `z`; the `rx`, `ry`, `rz` and `or` keys are ignored)
 
 ## Layer effects
 

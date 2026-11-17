@@ -259,10 +259,18 @@ impl Star {
         let half_angle = angle_per_point / 2.0;
         let rotation_rad = rotation_deg.to_radians() - FRAC_PI_2;
 
-        let total_vertices = if is_star { num_points * 2 } else { num_points };
+        let total_vertices = if is_star {
+            num_points.saturating_mul(2)
+        } else {
+            num_points
+        };
         let vertex_angle_step = if is_star { half_angle } else { angle_per_point };
 
-        let mut vertices: Vec<(Point, Point, Point)> = Vec::with_capacity(total_vertices);
+        let mut vertices: Vec<(Point, Point, Point)> = Vec::new();
+        // A point count that is too large to hold in memory has no outline.
+        if vertices.try_reserve_exact(total_vertices).is_err() {
+            return;
+        }
         let mut current_angle = rotation_rad;
 
         for i in 0..total_vertices {
@@ -295,7 +303,9 @@ impl Star {
             return;
         }
 
-        path.reserve(total_vertices * 3 + 2);
+        if path.try_reserve(total_vertices.saturating_add(2)).is_err() {
+            return;
+        }
         path.push(PathEl::MoveTo(vertices[0].0));
         for i in 1..vertices.len() {
             let prev_out = vertices[i - 1].2;
