@@ -22,6 +22,18 @@ const MAX_MAGNITUDE: f64 = 1e100;
 // extent is outside this range is measured scaled into it.
 const MEASURABLE_EXTENT: RangeInclusive<f64> = 1e-100..=1e100;
 
+// kurbo halves a curve until the error it estimates for each part is below the accuracy asked
+// for. The points of the parts are rounded to the floats at their coordinates, and once that
+// rounding is of the size of the accuracy the estimate no longer falls, so that kurbo halves
+// every part as far as it can: a million parts for one curve, and again for each step of
+// finding the parameter at a length. That is the case for a segment that lies far from the
+// origin compared to its length, where floats are spaced widely for a segment of its size.
+//
+// A segment is therefore measured where it lies only if floats at its coordinates are spaced
+// this many times finer than the accuracy, which is 2^24. Otherwise a copy of it that starts at the origin is
+// measured, whose coordinates are no larger than the segment is long.
+const RESOLUTION: f64 = 16_777_216.0;
+
 /// Returns a copy of the segment that kurbo can measure, and the factor that it was scaled by.
 ///
 /// The copy is the segment itself unless its extent is outside of what kurbo can measure. Then
@@ -75,17 +87,101 @@ pub(crate) fn measurable(segment: PathSeg) -> (PathSeg, f64) {
     (fitted, scale)
 }
 
+/// Returns the largest size of a coordinate of the segment.
+fn magnitude(segment: &PathSeg) -> f64 {
+    let size = |point: Point| point.x.abs().max(point.y.abs());
+    match segment {
+        PathSeg::Line(line) => size(line.p0).max(size(line.p1)),
+        PathSeg::Quad(quad) => size(quad.p0).max(size(quad.p1)).max(size(quad.p2)),
+        PathSeg::Cubic(cubic) => size(cubic.p0)
+            .max(size(cubic.p1))
+            .max(size(cubic.p2))
+            .max(size(cubic.p3)),
+    }
+}
+
+/// Returns an upper bound of the distance between neighbouring floats at the coordinates of
+/// the segment.
+fn spacing(segment: &PathSeg) -> f64 {
+    magnitude(segment) * f64::EPSILON
+}
+
+/// Returns a copy of the segment that starts at the origin.
+///
+/// The differences between the coordinates of a segment are rounded to a part in 2^53 of
+/// their own size, however large the coordinates are, so the copy has the shape of the
+/// segment as precisely as floats can hold it.
+fn at_origin(segment: PathSeg) -> PathSeg {
+    let origin = segment.start().to_vec2();
+    match segment {
+        PathSeg::Line(line) => PathSeg::Line(Line::new(line.p0 - origin, line.p1 - origin)),
+        PathSeg::Quad(quad) => PathSeg::Quad(QuadBez::new(
+            quad.p0 - origin,
+            quad.p1 - origin,
+            quad.p2 - origin,
+        )),
+        PathSeg::Cubic(cubic) => PathSeg::Cubic(CubicBez::new(
+            cubic.p0 - origin,
+            cubic.p1 - origin,
+            cubic.p2 - origin,
+            cubic.p3 - origin,
+        )),
+    }
+}
+
+/// A copy of a segment to measure in its place.
+struct Fitted {
+    /// The copy. Its curve parameters are those of the segment.
+    segment: PathSeg,
+    /// The factor that the lengths of the copy are larger by than those of the segment.
+    fit: f64,
+    /// The accuracy to measure the copy with.
+    accuracy: f64,
+}
+
+impl Fitted {
+    /// Returns the copy to measure of a segment of a path that was scaled by `scale`.
+    ///
+    /// The path has no coordinate above `MAX_MAGNITUDE`, which keeps the differences between
+    /// the coordinates of its segments finite.
+    fn new(segment: PathSeg, scale: f64) -> Self {
+        let (fitted, fit) = measurable(segment);
+        let scale = scale * fit;
+        let in_place = accuracy(&fitted, scale);
+        let (segment, accuracy) = if spacing(&fitted) * RESOLUTION <= in_place {
+            (fitted, in_place)
+        } else {
+            // The accuracy is no finer than `RELATIVE_ACCURACY` of the length of the control
+            // polygon, and the copy has no coordinate larger than that length, so its floats
+            // are spaced four million times finer than the accuracy.
+            let moved = at_origin(fitted);
+            (moved, accuracy(&moved, scale))
+        };
+        #[cfg(test)]
+        RESOLUTION_MEASURED.with(|least| {
+            least.set(least.get().min(accuracy / spacing(&segment)));
+        });
+        Self {
+            segment,
+            fit,
+            accuracy,
+        }
+    }
+}
+
 /// Returns the length of a segment of a path that was scaled by `scale`.
 fn segment_length(segment: PathSeg, scale: f64) -> f64 {
-    let (fitted, fit) = measurable(segment);
-    fitted.arclen(accuracy(&fitted, scale * fit)) / fit
+    let fitted = Fitted::new(segment, scale);
+    fitted.segment.arclen(fitted.accuracy) / fitted.fit
 }
 
 /// Returns the parameter at which a segment of a path that was scaled by `scale` reaches the
 /// given length.
 fn segment_parameter(segment: PathSeg, length: f64, scale: f64) -> f64 {
-    let (fitted, fit) = measurable(segment);
-    fitted.inv_arclen(length * fit, accuracy(&fitted, scale * fit))
+    let fitted = Fitted::new(segment, scale);
+    fitted
+        .segment
+        .inv_arclen(length * fitted.fit, fitted.accuracy)
 }
 
 /// Returns the accuracy to measure a segment with, for a path that was scaled by `scale`.
@@ -188,6 +284,10 @@ fn scaled(elements: &[PathEl], scale: f64) -> std::borrow::Cow<'_, [PathEl]> {
 thread_local! {
     /// Number of segments measured on this thread.
     pub(crate) static SEGMENTS_MEASURED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The least number of times that the accuracy of a measurement on this thread was larger
+    /// than the spacing of floats at the coordinates of what was measured.
+    pub(crate) static RESOLUTION_MEASURED: std::cell::Cell<f64> =
+        const { std::cell::Cell::new(f64::INFINITY) };
 }
 
 /// The lengths of the segments of a path.
@@ -357,9 +457,62 @@ fn trim_contour(
 
 #[cfg(test)]
 mod tests {
-    use super::{Measured, length, trim};
-    use kurbo::{PathEl, Point, Shape as _};
+    use super::{Fitted, Measured, RESOLUTION_MEASURED, length, magnitude, trim};
+    use kurbo::{
+        CubicBez, Line, ParamCurve as _, PathEl, PathSeg, Point, QuadBez, Shape as _, Vec2,
+    };
     use std::time::{Duration, Instant};
+
+    /// Floats at the coordinates of everything that is measured have to be spaced this many
+    /// times finer than the accuracy it is measured to. Then rounding cannot keep kurbo from
+    /// reaching the accuracy, and measuring a curve takes what it takes at the origin.
+    const RESOLVED: f64 = 4e6;
+
+    /// Trims a path in a few ways, and returns the least number of times that floats were
+    /// spaced finer than the accuracy of a measurement while it did, along with the pieces.
+    fn trimmed_resolution(path: &[PathEl]) -> (f64, Vec<Vec<PathEl>>) {
+        RESOLUTION_MEASURED.set(f64::INFINITY);
+        let measured = Measured::new(path);
+        let total = measured.length();
+        let mut pieces = Vec::new();
+        let mut cut = |ranges: &[(f64, f64)], sequential: Option<(f64, f64)>| {
+            let mut output = Vec::new();
+            trim(path, &measured, ranges, sequential, &mut output);
+            pieces.push(output);
+        };
+        cut(&[(0.1, 0.9)], None);
+        // A range that an offset wraps around the end of the path.
+        cut(&[(0.0, 0.25), (0.75, 1.0)], None);
+        // The path as the second of three of its length that a trim takes in turn.
+        cut(&[(0.2, 0.6)], Some((total, 3.0 * total)));
+        cut(&[(0.0, 0.4), (0.9, 1.0)], Some((total, 3.0 * total)));
+        (RESOLUTION_MEASURED.get(), pieces)
+    }
+
+    fn is_finite(path: &[PathEl]) -> bool {
+        path.iter().all(|element| match *element {
+            PathEl::MoveTo(p) | PathEl::LineTo(p) => p.is_finite(),
+            PathEl::QuadTo(p1, p2) => p1.is_finite() && p2.is_finite(),
+            PathEl::CurveTo(p1, p2, p3) => p1.is_finite() && p2.is_finite() && p3.is_finite(),
+            PathEl::ClosePath => true,
+        })
+    }
+
+    /// Cubics that take the most subdivisions to measure, in a unit square: an S, a cusp, one
+    /// that runs out and back along a line, a loop, and one with handles far longer than it.
+    const CUBICS: [[(f64, f64); 4]; 5] = [
+        [(0.0, 0.0), (0.5, 1.0), (0.5, -1.0), (1.0, 0.0)],
+        [(0.0, 0.0), (1.0, 1.0), (0.0, 1.0), (1.0, 0.0)],
+        [(0.0, 0.0), (1.0, 0.0), (-1.0, 0.0), (0.0, 0.0)],
+        [(0.0, 0.0), (1.0, 1.0), (-1.0, 1.0), (0.0, 0.0)],
+        [(0.0, 0.0), (1000.0, 1.0), (-1000.0, 1.0), (1.0, 0.0)],
+    ];
+
+    /// An open path of one cubic of the given size that starts at `origin`.
+    fn cubic_at(shape: &[(f64, f64); 4], origin: Point, size: f64) -> Vec<PathEl> {
+        let [p0, p1, p2, p3] = shape.map(|(x, y)| origin + Vec2::new(x, y) * size);
+        vec![PathEl::MoveTo(p0), PathEl::CurveTo(p1, p2, p3)]
+    }
 
     /// An open path of `count` S-shaped curves, each `size` wide, that runs along the X axis.
     fn curvy(count: usize, size: f64) -> Vec<PathEl> {
@@ -484,5 +637,181 @@ mod tests {
         assert_eq!(half.len(), 5);
         let end = half.as_slice().bounding_box().x1;
         assert!((end - 400.0).abs() < 0.5, "half ends at {end}");
+    }
+
+    #[test]
+    fn segment_is_measured_where_it_lies_unless_floats_are_too_coarse_there() {
+        let s_curve = |x: f64, size: f64| {
+            PathSeg::Cubic(CubicBez::new(
+                (x, 0.0),
+                (x + size * 0.5, size),
+                (x + size * 0.5, -size),
+                (x + size, 0.0),
+            ))
+        };
+        // At the coordinates of authored animations a segment is measured as it is, so its
+        // trims come out as they always did.
+        for x in [0.0, 1.0, 500.0, 1e5, 1e7] {
+            for size in [1e-3, 1.0, 100.0, 1e5] {
+                let segment = s_curve(x, size);
+                let fitted = Fitted::new(segment, 1.0);
+                assert_eq!(fitted.segment, segment, "at {x}, {size} long");
+                assert_eq!(fitted.fit, 1.0);
+                assert_eq!(fitted.accuracy, 0.1);
+            }
+        }
+        // Far from the origin the copy starts at the origin and is no larger than the segment.
+        for (x, size) in [(1e9, 1.0), (1e18, 8388608.0), (1e30, 2.0_f64.powi(47))] {
+            let segment = s_curve(x, size);
+            let fitted = Fitted::new(segment, 1.0);
+            assert_eq!(fitted.segment.start(), Point::ORIGIN, "at {x}");
+            assert!(magnitude(&fitted.segment) <= size, "at {x}");
+            // It has the shape of the segment to the last bit that the segment has it to.
+            let PathSeg::Cubic(cubic) = segment else {
+                unreachable!()
+            };
+            let origin = cubic.p0.to_vec2();
+            let expected = CubicBez::new(
+                cubic.p0 - origin,
+                cubic.p1 - origin,
+                cubic.p2 - origin,
+                cubic.p3 - origin,
+            );
+            assert_eq!(fitted.segment, PathSeg::Cubic(expected));
+        }
+    }
+
+    #[test]
+    fn curve_far_from_the_origin_is_trimmed_like_the_same_curve_at_the_origin() {
+        // One float step wide at its coordinates. Measured where it lies, kurbo splits it into
+        // a million parts, and again for each step of finding where the trim cuts it.
+        let step = 2.0_f64.powi(47);
+        let far = cubic_at(&CUBICS[0], Point::new(1e30, 0.0), step);
+        // What floats hold of the curve: both handles round to the nearest end.
+        let near = [
+            PathEl::MoveTo(Point::new(0.0, 0.0)),
+            PathEl::CurveTo(
+                Point::new(0.0, step),
+                Point::new(0.0, -step),
+                Point::new(step, 0.0),
+            ),
+        ];
+        assert_eq!(length(&far), length(&near));
+        let (resolution, pieces) = trimmed_resolution(&far);
+        assert!(resolution >= RESOLVED, "{resolution}");
+        let (_, near_pieces) = trimmed_resolution(&near);
+        for (piece, near_piece) in pieces.iter().zip(&near_pieces) {
+            assert!(!piece.is_empty());
+            assert_eq!(piece.len(), near_piece.len());
+            let (bounds, near_bounds) = (
+                piece.as_slice().bounding_box(),
+                near_piece.as_slice().bounding_box(),
+            );
+            // Along Y the curve is as precise far away as it is at the origin.
+            assert_eq!((bounds.y0, bounds.y1), (near_bounds.y0, near_bounds.y1));
+            // Along X it is no more precise than floats are there.
+            assert!(
+                bounds.x0 >= 1e30 - 4.0 * step && bounds.x1 <= 1e30 + 4.0 * step,
+                "{bounds:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn curves_that_are_short_for_their_coordinates_are_measured_at_the_origin() {
+        let start = Instant::now();
+        let mut trimmed = 0;
+        // From where floats are a hundredth of a unit apart to where they are 1e14 apart, and
+        // one place beyond what a path is measured unscaled at.
+        for exponent in [14, 15, 16, 17, 18, 20, 25, 30, 60, 99, 120] {
+            let far = 10.0_f64.powi(exponent);
+            let step = far * f64::EPSILON;
+            // From one float step long to as long as the curve is far away.
+            for steps in [0, 1, 2, 4, 8, 12, 16, 20, 24, 32, 40, 52] {
+                let size = step * 2.0_f64.powi(steps);
+                for shape in &CUBICS {
+                    for origin in [
+                        Point::new(far, 0.0),
+                        Point::new(-far * 0.7, far),
+                        Point::new(0.0, -far),
+                    ] {
+                        let path = cubic_at(shape, origin, size);
+                        let (resolution, pieces) = trimmed_resolution(&path);
+                        assert!(
+                            resolution >= RESOLVED,
+                            "{shape:?} of {size} at {origin:?}: {resolution}"
+                        );
+                        assert!(pieces.iter().all(|piece| is_finite(piece)));
+                        trimmed += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(trimmed, 11 * 12 * 5 * 3);
+        // Measured where they lie, a single one of the worst of these took half a second
+        // with optimizations. All of them take a few milliseconds without, so this holds on
+        // a slow and busy machine.
+        assert!(start.elapsed() < Duration::from_secs(60));
+    }
+
+    #[test]
+    fn lines_quadratics_and_segments_without_length_far_from_the_origin_are_trimmed() {
+        let far = 1e30;
+        let step = far * f64::EPSILON;
+        let at = |x: f64, y: f64| Point::new(far + x * step, y * step);
+        let paths = [
+            // Lines, of which one has no length.
+            vec![
+                PathEl::MoveTo(at(0.0, 0.0)),
+                PathEl::LineTo(at(3.0, 2.0)),
+                PathEl::LineTo(at(3.0, 2.0)),
+                PathEl::LineTo(at(0.0, 4.0)),
+                PathEl::ClosePath,
+            ],
+            // Quadratics: an arc, and one that runs out and back along a line.
+            vec![
+                PathEl::MoveTo(at(0.0, 0.0)),
+                PathEl::QuadTo(at(4.0, 4.0), at(8.0, 0.0)),
+                PathEl::QuadTo(at(16.0, 0.0), at(8.0, 0.0)),
+            ],
+            // Cubics that are a point, and that only have handles at one end.
+            vec![
+                PathEl::MoveTo(at(0.0, 0.0)),
+                PathEl::CurveTo(at(0.0, 0.0), at(0.0, 0.0), at(0.0, 0.0)),
+                PathEl::CurveTo(at(0.0, 0.0), at(4.0, 1.0), at(4.0, 1.0)),
+                PathEl::CurveTo(at(4.0, 1.0), at(4.0, 1.0), at(0.0, 0.0)),
+            ],
+        ];
+        for path in &paths {
+            let (resolution, pieces) = trimmed_resolution(path);
+            assert!(resolution >= RESOLVED, "{path:?}: {resolution}");
+            let total = length(path);
+            assert!(total > 0.0 && total.is_finite());
+            for piece in &pieces {
+                assert!(!piece.is_empty() && is_finite(piece), "{path:?}: {piece:?}");
+                // A piece lies within the path, give or take the rounding of its points.
+                let bounds = piece.as_slice().bounding_box();
+                let within = path.as_slice().bounding_box().inflate(step, step);
+                assert!(within.union(bounds) == within, "{piece:?}");
+            }
+        }
+        // The same far away along one axis only, and at the largest coordinates there are.
+        for origin in [Point::new(0.0, -1e30), Point::new(1.5e308, -1.5e308)] {
+            let step = 1.5e308 * f64::EPSILON;
+            let line = Line::new(origin, origin + Vec2::new(step, step * 3.0));
+            let quad = QuadBez::new(
+                origin,
+                origin + Vec2::new(step * 2.0, 0.0),
+                origin + Vec2::new(step * 2.0, step * 2.0),
+            );
+            for path in [
+                vec![PathEl::MoveTo(line.p0), PathEl::LineTo(line.p1)],
+                vec![PathEl::MoveTo(quad.p0), PathEl::QuadTo(quad.p1, quad.p2)],
+            ] {
+                let (resolution, pieces) = trimmed_resolution(&path);
+                assert!(resolution >= RESOLVED, "{path:?}: {resolution}");
+                assert!(pieces.iter().all(|piece| is_finite(piece)), "{pieces:?}");
+            }
+        }
     }
 }

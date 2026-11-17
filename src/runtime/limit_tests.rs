@@ -929,6 +929,164 @@ fn trim_of_long_curves_takes_no_longer_than_of_short_ones() {
     assert!(start.elapsed() < std::time::Duration::from_secs(5));
 }
 
+/// Runs `work` on a thread of its own and returns what it returns.
+///
+/// Panics if the work takes longer than a minute. This is for work that takes milliseconds
+/// when it is bounded, and minutes to hours when it is not. A minute is far more than a slow
+/// and busy machine needs for the first, and it keeps the second from holding up the tests.
+fn within_a_minute<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    use std::sync::mpsc::{RecvTimeoutError, channel};
+    let (sender, receiver) = channel();
+    std::thread::spawn(move || sender.send(work()));
+    match receiver.recv_timeout(std::time::Duration::from_secs(60)) {
+        Ok(result) => result,
+        Err(RecvTimeoutError::Timeout) => panic!("the work took longer than a minute"),
+        Err(RecvTimeoutError::Disconnected) => panic!("the work panicked"),
+    }
+}
+
+/// What rendering and querying a frame of a trimmed layer came to.
+struct Trimmed {
+    /// Bounds of the paths that were drawn.
+    drawn: Vec<kurbo::Rect>,
+    /// Number of paths that the layer has.
+    paths: usize,
+    /// Number of curves that were measured to render the frame.
+    measured: usize,
+    /// The least number of times that floats were spaced finer than the accuracy of a
+    /// measurement, at the coordinates of what was measured.
+    resolution: f64,
+}
+
+/// Renders the first frame of a layer with the given shapes, and queries its paths.
+fn trimmed(shapes: Value) -> Trimmed {
+    use super::trim::{RESOLUTION_MEASURED, SEGMENTS_MEASURED};
+    let composition = import_shapes(shapes).unwrap();
+    within_a_minute(move || {
+        RESOLUTION_MEASURED.set(f64::INFINITY);
+        SEGMENTS_MEASURED.set(0);
+        let drawn = render(&composition, 0.0, 1.0)
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::Draw { bounds, .. } => Some(bounds),
+                _ => None,
+            })
+            .collect();
+        let measured = SEGMENTS_MEASURED.get();
+        let paths = composition.evaluate(0.0).unwrap().layers[0]
+            .evaluated_paths()
+            .len();
+        Trimmed {
+            drawn,
+            paths,
+            measured,
+            resolution: RESOLUTION_MEASURED.get(),
+        }
+    })
+}
+
+/// An open path of one curve. The control points and the end are relative to the start.
+fn curve(start: [f64; 2], p1: [f64; 2], p2: [f64; 2], end: [f64; 2]) -> Value {
+    let vertices = [start, [start[0] + end[0], start[1] + end[1]]];
+    let out_tangents = [p1, [0.0, 0.0]];
+    let in_tangents = [[0.0, 0.0], [p2[0] - end[0], p2[1] - end[1]]];
+    json!({
+        "ty": "sh",
+        "ks": fixed(json!({ "c": false, "v": vertices, "i": in_tangents, "o": out_tangents })),
+    })
+}
+
+/// A trim path that keeps the part of each path from a tenth to nine tenths of its length.
+fn inner_trim() -> Value {
+    json!({ "ty": "tm", "s": fixed(10), "e": fixed(90), "o": fixed(0), "m": 1 })
+}
+
+/// Floats at the coordinates of a curve that is measured have to be spaced this many times
+/// finer than the accuracy it is measured to. Rounding then cannot keep the measuring from
+/// reaching its accuracy, so it takes what it takes for the same curve at the origin.
+const RESOLVED: f64 = 4e6;
+
+#[test]
+fn trim_of_a_curve_far_from_the_origin_is_measured_at_the_origin() {
+    // An S-shaped curve at 1e30, where floats are 2^47 apart, that is one such step wide and
+    // two high. Measured where it lies it took half a second in an optimized build: split in
+    // two, its halves are rounding errors, which never get accurate enough to stop splitting.
+    let step = 2.0_f64.powi(47);
+    let s_curve = |x: f64| curve([x, 0.0], [0.0, step], [0.0, -step], [step, 0.0]);
+    let far = trimmed(json!([s_curve(1e30), inner_trim(), stroke(100.0)]));
+    assert!(far.resolution >= RESOLVED, "{}", far.resolution);
+    assert_eq!((far.drawn.len(), far.paths, far.measured), (1, 1, 1));
+    // It is trimmed to the part that the same curve at the origin is trimmed to. Along Y,
+    // where its coordinates are small, that is exact.
+    let near = trimmed(json!([s_curve(0.0), inner_trim(), stroke(100.0)]));
+    assert_eq!(near.drawn.len(), 1);
+    let (far, near) = (far.drawn[0], near.drawn[0]);
+    assert_eq!((far.y0, far.y1), (near.y0, near.y1));
+    assert!(near.y0 < 0.0 && near.y1 > 0.0 && near.height() < 2.0 * step);
+    assert!(far.x0.is_finite() && far.x1.is_finite());
+}
+
+#[test]
+fn trim_of_many_curves_far_from_the_origin_renders() {
+    // The same curve and two thousand copies of it, which is within every limit. At half a
+    // second each this frame took a quarter of an hour.
+    let step = 2.0_f64.powi(47);
+    let far = trimmed(json!([
+        curve([1e30, 0.0], [0.0, step], [0.0, -step], [step, 0.0]),
+        copies(2000),
+        inner_trim(),
+        stroke(100.0),
+    ]));
+    assert!(far.resolution >= RESOLVED, "{}", far.resolution);
+    // One stroke draws the path and its copies.
+    assert_eq!((far.drawn.len(), far.paths, far.measured), (1, 2001, 2001));
+}
+
+#[test]
+fn trim_of_shapes_that_are_small_for_where_they_lie_renders() {
+    let step = 2.0_f64.powi(47);
+    let rounded_rectangle = json!({
+        "ty": "rc",
+        "p": fixed(json!([1e30, 0])),
+        "s": fixed(json!([8.0 * step, 8.0 * step])),
+        "r": fixed(2.0 * step),
+    });
+    let far_ellipse = json!({
+        "ty": "el",
+        "p": fixed(json!([1e30, 0])),
+        "s": fixed(json!([2.0 * step, 2.0 * step])),
+    });
+    // Curves that are long in units and still short for their coordinates: tens of
+    // thousands of float steps at 1e17, 1e18 and 1e20, where a curve took tens of
+    // milliseconds to measure.
+    let looped = |x: f64, size: f64| curve([x, 0.0], [0.0, size], [-size, size], [0.0, 0.0]);
+    let s_curve = |x: f64, size: f64| {
+        curve(
+            [x, 0.0],
+            [size / 2.0, size],
+            [size / 2.0, -size],
+            [size, 0.0],
+        )
+    };
+    let shapes = [
+        vec![rounded_rectangle],
+        vec![far_ellipse],
+        vec![looped(1e17, 16777216.0)],
+        vec![s_curve(1e18, 8388608.0); 4],
+        vec![s_curve(1e20, 4194304.0); 4],
+        vec![looped(1e20, 67108864.0), s_curve(-1e25, 1e12)],
+    ];
+    for mut shapes in shapes {
+        let paths = shapes.len();
+        shapes.extend([inner_trim(), stroke(100.0)]);
+        let far = trimmed(Value::Array(shapes.clone()));
+        assert!(far.resolution >= RESOLVED, "{shapes:?}: {}", far.resolution);
+        assert_eq!((far.drawn.len(), far.paths), (1, paths), "{shapes:?}");
+        let bounds = far.drawn[0];
+        assert!(bounds.is_finite() && bounds.area() > 0.0, "{bounds:?}");
+    }
+}
+
 #[test]
 fn shape_checks_follow_what_is_animated() {
     let check = |shapes: Value| import_shapes(shapes).unwrap().layers[0].shape_check;
