@@ -334,6 +334,7 @@ pub struct UnsupportedEffect {
 ///
 /// See [`Composition::unsupported_layers`](crate::Composition).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct UnsupportedLayer {
     /// Identifier of the precomposition asset that holds the layer, or `None` if the layer is
     /// in the main composition.
