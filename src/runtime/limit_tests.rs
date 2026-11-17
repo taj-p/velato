@@ -192,6 +192,16 @@ fn repeater_copies_are_limited_at_import() {
             "{count} copies"
         );
     }
+    // A number of copies that is not whole makes the next whole number of copies.
+    let most = MAX_REPEATER_COPIES as f64;
+    assert!(import_shapes(shapes(most - 0.6)).is_ok());
+    for count in [most + 0.01, most + 0.4, most + 0.5] {
+        assert_eq!(
+            import_limit(import_shapes(shapes(count))),
+            Limit::RepeaterCopies,
+            "{count} copies"
+        );
+    }
 }
 
 #[test]
@@ -202,8 +212,15 @@ fn animated_repeater_copies_are_limited_at_the_frame() {
     );
     let shapes = json!([rect(0.0, 0.0, 10.0, 10.0), fill(100.0), animated_copies]);
     let composition = import_shapes(shapes).unwrap();
-    // 1,934 copies.
+    // 1,934 and a third copies, which makes 1,935.
     assert!(composition.evaluate(29.0).is_ok());
+    // 1,999 and two thirds, which makes 2,000.
+    assert!(composition.evaluate(29.98).is_ok());
+    // A little over 2,000, which makes 2,001.
+    assert_eq!(
+        composition.evaluate(29.99).unwrap_err(),
+        exceeded(Limit::RepeaterCopies)
+    );
     // 2,001 copies.
     assert_eq!(
         composition.evaluate(30.0).unwrap_err(),
@@ -527,7 +544,7 @@ fn layers_count_at_the_frames_at_which_they_are_rendered() {
 fn layer_with_animated_copies_counts_when_it_is_not_rendered() {
     let animated_copies = with(
         repeater(1, 1.0, 100.0, 100.0),
-        json!({ "c": animated(4.0, 4.4) }),
+        json!({ "c": animated(3.6, 4.0) }),
     );
     // 50 elements at every frame: the path and its four copies.
     let dynamic = with(

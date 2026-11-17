@@ -3903,4 +3903,44 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn repeater_makes_the_next_whole_number_of_copies() {
+        let alphas = |copies: serde_json::Value| -> Vec<f32> {
+            let repeater = with(repeater(1, 20.0, 100.0, 40.0), json!({ "c": copies }));
+            let shapes = json!([rect(0.0, 0.0, 10.0, 10.0), fill(100.0), repeater]);
+            render(&composition(json!([shape_layer(1, shapes)])), 30.0, 1.0)
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Draw { alpha, .. } => Some(*alpha),
+                    _ => None,
+                })
+                .collect()
+        };
+        let fixed = |copies: f64| alphas(json!({ "a": 0, "k": copies }));
+        // The opacity runs from the first to the last of the copies that are made, which
+        // are painted last to first.
+        assert_eq!(fixed(3.0), [0.4, 0.7, 1.0]);
+        assert_eq!(fixed(2.4), [0.4, 0.7, 1.0]);
+        assert_eq!(fixed(2.0), [0.4, 1.0]);
+        assert_eq!(fixed(1.01), [0.4, 1.0]);
+        assert_eq!(fixed(0.4), [1.0]);
+        assert_eq!(fixed(0.0), [0.0_f32; 0]);
+        assert_eq!(fixed(-0.4), [0.0_f32; 0]);
+        // Halfway from one copy to two and a half: one and three quarters, which makes two.
+        let growing = json!({ "a": 1, "k": [{ "t": 0, "s": [1] }, { "t": 60, "s": [2.5] }] });
+        assert_eq!(alphas(growing), [0.4, 1.0]);
+        // A style after the repeater draws the source and the copies as one path.
+        let after = |copies: f64| {
+            let repeater = with(
+                repeater(1, 20.0, 100.0, 100.0),
+                json!({ "c": { "a": 0, "k": copies } }),
+            );
+            let shapes = json!([rect(0.0, 0.0, 10.0, 10.0), repeater, fill(100.0)]);
+            let events = render(&composition(json!([shape_layer(1, shapes)])), 0.0, 1.0);
+            draw_bounds(&events)
+        };
+        assert_eq!(after(2.4), [Rect::new(0.0, 0.0, 50.0, 10.0)]);
+        assert_eq!(after(0.4), [Rect::new(0.0, 0.0, 10.0, 10.0)]);
+    }
 }

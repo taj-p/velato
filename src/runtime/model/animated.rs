@@ -539,8 +539,11 @@ impl Repeater {
     }
 
     /// Returns the number of copies at the specified frame.
+    ///
+    /// A number that is not whole makes the next whole number of copies, as in lottie-web:
+    /// 2.4 copies are three, and 0.4 are one.
     pub(crate) fn copy_count(&self, frame: f64) -> usize {
-        self.copies.evaluate(frame).round() as usize
+        self.copies.evaluate(frame).ceil() as usize
     }
 
     /// Evaluates the repeater at the specified frame.

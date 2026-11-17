@@ -69,6 +69,9 @@
 use std::fmt;
 
 /// Most copies a single repeater may make.
+///
+/// A number of copies that is not whole makes the next whole number of copies, which is the
+/// number that counts: 2,000.4 copies are 2,001.
 pub const MAX_REPEATER_COPIES: usize = 2_000;
 
 /// Most points a single star or polygon may have.
