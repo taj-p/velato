@@ -969,24 +969,17 @@ impl Batch {
                 geometry.elements = new_start..self.trim_elements.len();
             }
         } else {
-            let mut path = Vec::new();
             for geometry in &mut self.geometries[geometry_start..] {
-                path.clear();
-                path.extend(
-                    self.elements[geometry.elements.clone()]
-                        .iter()
-                        .map(|element| geometry.transform * *element),
-                );
+                let path = &self.elements[geometry.elements.clone()];
                 let new_start = self.trim_elements.len();
                 super::trim::trim(
-                    &path,
-                    &Measured::new(&path),
+                    path,
+                    &Measured::new(path),
                     &ranges,
                     None,
                     &mut self.trim_elements,
                 );
                 geometry.elements = new_start..self.trim_elements.len();
-                geometry.transform = Affine::IDENTITY;
             }
         }
 
@@ -2545,6 +2538,57 @@ mod tests {
         assert_eq!(clips.len(), 2);
         let side = clips[1].width();
         assert!((side - 22.2).abs() < 0.05, "{side}");
+    }
+
+    #[test]
+    fn trim_outside_a_scaled_group_measures_paths_in_their_own_space() {
+        use kurbo::Shape as _;
+        // A corner with two sides of ten units, in a group that is four times as wide as it
+        // is high. Half of the corner is its first side, whatever the group makes of it.
+        let corner = json!({
+            "ty": "sh",
+            "ks": {
+                "a": 0,
+                "k": {
+                    "c": false,
+                    "v": [[0, 0], [10, 0], [10, 10]],
+                    "i": [[0, 0], [0, 0], [0, 0]],
+                    "o": [[0, 0], [0, 0], [0, 0]],
+                },
+            },
+        });
+        let wide = with(
+            transform(100.0),
+            json!({ "ty": "tr", "s": { "a": 0, "k": [400, 100] } }),
+        );
+        let half = |mode: u8| {
+            json!({
+                "ty": "tm",
+                "s": { "a": 0, "k": 0 },
+                "e": { "a": 0, "k": 50 },
+                "o": { "a": 0, "k": 0 },
+                "m": mode,
+            })
+        };
+        for mode in [1, 2] {
+            let shapes = json!([
+                { "ty": "gr", "it": [corner.clone(), wide.clone()] },
+                half(mode),
+                stroke(100.0),
+            ]);
+            let composition = composition(json!([shape_layer(1, shapes)]));
+            let events = render(&composition, 0.0, 1.0);
+            // Measured after the group had stretched it, half of the corner was 25 of the 40
+            // units of its first side.
+            assert_eq!(
+                draw_bounds(&events),
+                [Rect::new(0.0, 0.0, 40.0, 0.0)],
+                "mode {mode}"
+            );
+            let paths = composition.evaluate(0.0).unwrap().layers[0].evaluated_paths();
+            assert_eq!(paths.len(), 1);
+            assert_eq!(paths[0].bounding_box(), Rect::new(0.0, 0.0, 40.0, 0.0));
+        }
     }
 
     #[test]
