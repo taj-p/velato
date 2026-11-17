@@ -55,6 +55,16 @@ Gaussian blur, drop shadow, fill, and tint require a custom `RenderSink` impleme
 
 **Important:** Effect color handling follows ThorVG, used by the LottieFiles' player: only RGB is used from effect colors. Fill and shadow use their separate opacity settings; tint keeps the layer's transparency. Gaussian blur blurs both color and alpha.
 
+## Limits
+
+Velato limits what one frame of an animation may ask for, so that a small file cannot take time, memory or stack without bound.
+A repeater may make 2,000 copies, a star or polygon may have 2,000 points and a gradient 256 stops.
+One frame may hold 100,000 shapes, 2,000,000 path elements, of which 30,000 under trim paths, and 20,000 layers, nested 32 deep.
+Shape groups may nest 64 deep.
+An animation that is over a limit fails to import, or fails to evaluate at the frame where it is over, with an error that names the limit.
+It is never drawn in part.
+The documentation of the `limits` module says what counts toward each limit.
+
 ## Usage
 
 Velato makes it simple to encode Lottie as a [`vello::Scene`](https://docs.rs/vello/*/vello/struct.Scene.html).

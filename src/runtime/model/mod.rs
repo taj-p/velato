@@ -1,6 +1,7 @@
 // Copyright 2024 the Velato Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
+use crate::limits::{Limit, Limits, ShapeCheck, ShapeError};
 use kurbo::{Affine, PathEl, Point, Shape as _, Size, Vec2};
 use peniko::{BlendMode, Color};
 use std::ops::Range;
@@ -168,6 +169,25 @@ impl Brush {
         matches!(self, Self::Fixed(_))
     }
 
+    /// Returns the most colour stops the brush evaluates to at any frame.
+    pub(crate) fn max_color_stops(&self) -> usize {
+        match self {
+            Self::Fixed(fixed::Brush::Gradient(gradient)) => gradient.stops.len(),
+            Self::Animated(animated::Brush::Gradient(gradient)) => match &gradient.stops {
+                ColorStops::Fixed(stops) => stops.len(),
+                // Five numbers for each stop of a keyframe.
+                ColorStops::Animated(stops) => stops
+                    .values
+                    .iter()
+                    .map(|values| values.len() / 5)
+                    .max()
+                    .unwrap_or(0)
+                    .min(stops.count),
+            },
+            _ => 0,
+        }
+    }
+
     pub fn evaluate(&self, alpha: f64, frame: f64) -> ValueRef<'_, fixed::Brush> {
         match self {
             Self::Fixed(value) => {
@@ -198,6 +218,38 @@ pub enum Geometry {
 }
 
 impl Geometry {
+    /// Returns the most elements that [`Self::evaluate`] emits at this frame, or the reason
+    /// the geometry cannot be evaluated.
+    pub(crate) fn max_elements(&self, frame: f64, limits: &Limits) -> Result<usize, ShapeError> {
+        match self {
+            Self::Fixed(value) => Ok(value.len()),
+            Self::Rect(value) if value.has_finite_size(frame) => Ok(animated::Rect::MAX_ELEMENTS),
+            Self::Ellipse(value) if value.has_finite_size(frame) => {
+                Ok(animated::Ellipse::MAX_ELEMENTS)
+            }
+            Self::Rect(_) | Self::Ellipse(_) => Err(ShapeError::NonFiniteSize),
+            Self::Spline(value) => Ok(value.max_elements(frame)),
+            Self::Star(value) => {
+                let points = value.point_count(frame);
+                if points > limits.polystar_points {
+                    return Err(Limit::PolystarPoints.into());
+                }
+                Ok(value.max_elements(points))
+            }
+        }
+    }
+
+    /// Whether [`Self::max_elements`] returns the same at every frame.
+    pub(crate) fn has_fixed_size(&self) -> bool {
+        match self {
+            Self::Fixed(_) => true,
+            Self::Spline(value) => value.has_fixed_point_count(),
+            Self::Rect(value) => value.size.is_fixed() && value.corner_radius.is_fixed(),
+            Self::Ellipse(value) => value.size.is_fixed(),
+            Self::Star(value) => value.points.is_fixed(),
+        }
+    }
+
     pub fn evaluate(&self, frame: f64, path: &mut Vec<PathEl>) {
         match self {
             Self::Fixed(value) => {
@@ -229,6 +281,17 @@ pub struct Draw {
     pub opacity: Value<f64>,
     /// Rule that decides which parts of the paths a fill covers. Strokes do not use it.
     pub fill_rule: peniko::Fill,
+}
+
+impl Draw {
+    /// Returns the most colour stops and dashes that the brush and stroke hold at any frame.
+    pub(crate) fn max_paint_elements(&self) -> usize {
+        let dashes = match &self.stroke {
+            Some(Stroke::Fixed(stroke)) => stroke.dash_pattern.len(),
+            _ => 0,
+        };
+        self.brush.max_color_stops().saturating_add(dashes)
+    }
 }
 
 /// Elements of a shape layer.
@@ -416,6 +479,13 @@ pub struct Layer {
     pub matte: Option<(BlendMode, LayerReference)>,
     /// Content of the layer.
     pub content: Content,
+    /// When the shapes of the layer have to be counted for the [limits](crate::limits).
+    ///
+    /// Import counts shapes that never change in number once, and records it here. The record
+    /// is not updated when the content of an imported layer is replaced afterwards. A layer
+    /// that is made in another way has its shapes counted each time the composition is
+    /// evaluated.
+    pub(crate) shape_check: ShapeCheck,
 }
 
 /// Matte layer mode.

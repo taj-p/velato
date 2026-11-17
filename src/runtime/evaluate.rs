@@ -3,7 +3,8 @@
 
 use super::Composition;
 use super::model::{Content, Layer, LayerReference, Shape, TransformComponents};
-use super::render::evaluate_paths;
+use super::render::{check_fixed_shapes, count_shapes, evaluate_paths};
+use crate::limits::{Limit, Limits, ShapeCheck, ShapeCost, ShapeError};
 use kurbo::{Affine, PathEl, Point};
 use peniko::BlendMode;
 
@@ -12,18 +13,34 @@ use peniko::BlendMode;
 pub struct OccurrencePath(pub Vec<usize>);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum EvaluationError {
     NonFiniteTime,
     InvalidStretch(OccurrencePath),
     InvalidTransform(OccurrencePath),
     InvalidParent(OccurrencePath),
-    UnresolvedParent { path: OccurrencePath, id: usize },
+    UnresolvedParent {
+        path: OccurrencePath,
+        id: usize,
+    },
     ParentCycle(OccurrencePath),
     InvalidMatte(OccurrencePath),
-    UnresolvedMatte { path: OccurrencePath, id: usize },
+    UnresolvedMatte {
+        path: OccurrencePath,
+        id: usize,
+    },
     MatteCycle(OccurrencePath),
     MissingAsset(String),
     PrecompCycle(String),
+    /// The animation asks for more at this frame than a [limit](crate::limits) allows.
+    LimitExceeded {
+        /// The limit that is exceeded.
+        limit: Limit,
+        /// The most that the limit allows.
+        maximum: usize,
+    },
+    /// A rectangle or ellipse in this layer has a size that is not finite at this frame.
+    InvalidShape(OccurrencePath),
 }
 
 impl std::fmt::Display for EvaluationError {
@@ -36,6 +53,10 @@ impl std::fmt::Display for EvaluationError {
             Self::UnresolvedMatte { path, id } => write!(
                 f,
                 "No matte layer with ind {id} in the composition containing {path:?}"
+            ),
+            Self::LimitExceeded { limit, maximum } => write!(
+                f,
+                "Lottie evaluation failed: the animation has more than {maximum} {limit}"
             ),
             _ => write!(f, "Lottie evaluation failed: {self:?}"),
         }
@@ -178,21 +199,195 @@ impl EvaluatedComposition<'_> {
 impl Composition {
     /// Samples layers at a frame without drawing; returns errors for invalid data.
     ///
-    /// NOTE: Nested compositions have no size or depth limit.
+    /// Fails if the animation asks for more at this frame than the [limits](crate::limits)
+    /// allow. What it returns is within them.
     pub fn evaluate(&self, frame: f64) -> Result<EvaluatedComposition<'_>, EvaluationError> {
-        let layers = evaluate_layers(
-            self,
-            &self.layers,
-            frame,
-            Affine::IDENTITY,
-            true,
-            &mut Vec::new(),
-            &mut Vec::new(),
-        )?;
+        self.evaluate_within(frame, &Limits::DEFAULT)
+    }
+
+    pub(crate) fn evaluate_within<'a>(
+        &'a self,
+        frame: f64,
+        limits: &'a Limits,
+    ) -> Result<EvaluatedComposition<'a>, EvaluationError> {
+        let mut evaluation = Evaluation {
+            animation: self,
+            limits,
+            layers: 0,
+            passes: ShapeCost::default(),
+            counted: ShapeCost::default(),
+            prefix: Vec::new(),
+            assets: Vec::new(),
+        };
+        let (layers, rendered) =
+            evaluation.evaluate_layers(&self.layers, frame, Affine::IDENTITY, true, true)?;
+        // Shapes that were counted for layers that are not rendered count with the ones that
+        // are.
+        let mut shapes = rendered.shapes;
+        shapes
+            .add(evaluation.counted, limits)
+            .map_err(|limit| EvaluationError::LimitExceeded {
+                limit,
+                maximum: limits.maximum(limit),
+            })?;
         Ok(EvaluatedComposition {
             composition: self,
             layers,
         })
+    }
+
+    /// Checks what can be known about the limits without a frame, and records the count of
+    /// the shapes that never change in number.
+    pub(crate) fn check_limits(&mut self, limits: &Limits) -> Result<(), crate::Error> {
+        let limit_exceeded = |limit| crate::Error::LimitExceeded {
+            limit,
+            maximum: limits.maximum(limit),
+        };
+        let exceeded = |error| match error {
+            ShapeError::Limit(limit) => Some(limit_exceeded(limit)),
+            // A fixed size is a number from the file, which is finite. A size that is animated
+            // may be finite at another frame, so it is left to the evaluation of a frame.
+            ShapeError::NonFiniteSize => None,
+        };
+        for layer in self.assets.values_mut().flatten().chain(&mut self.layers) {
+            let Content::Shape(shapes) = &layer.content else {
+                continue;
+            };
+            let check = check_fixed_shapes(shapes, limits, 0).and_then(|fixed| {
+                Ok(if fixed {
+                    ShapeCheck::Never(count_shapes(shapes, 0.0, limits)?)
+                } else {
+                    ShapeCheck::EveryFrame
+                })
+            });
+            layer.shape_check = match check.map_err(exceeded) {
+                Ok(check) => check,
+                Err(None) => ShapeCheck::EveryFrame,
+                Err(Some(error)) => return Err(error),
+            };
+        }
+        let mut structure = Structure {
+            animation: self,
+            limits,
+            layers: 0,
+            assets: Vec::new(),
+        };
+        structure
+            .visit_layers(&self.layers, 1)
+            .map_err(limit_exceeded)
+    }
+}
+
+/// Returns the index of the layer that mattes a layer, if it is one of `layers`.
+fn matte_source(layers: &[Layer], index: usize) -> Option<usize> {
+    match layers[index].matte {
+        Some((_, LayerReference::Resolved(source))) if source < layers.len() => Some(source),
+        _ => None,
+    }
+}
+
+/// A walk over the layers of a composition in the way that rendering walks them, with every
+/// layer taken to be active. It finds out whether the composition can be within the limits on
+/// layers at any frame.
+struct Structure<'a> {
+    animation: &'a Composition,
+    limits: &'a Limits,
+    /// Layers visited.
+    layers: usize,
+    /// Precompositions that hold the layers being visited.
+    assets: Vec<&'a str>,
+}
+
+impl<'a> Structure<'a> {
+    fn visit_layers(&mut self, layers: &'a [Layer], depth: usize) -> Result<(), Limit> {
+        // Evaluation fails for layers that matte each other in a cycle. That is its error to
+        // report, so here such layers count as having no mattes.
+        let mattes = dependency_order(layers.len(), |index| matte_source(layers, index)).is_ok();
+        // A layer that mattes another is rendered for that layer only.
+        let mut is_source = vec![false; layers.len()];
+        if mattes {
+            for index in 0..layers.len() {
+                if let Some(source) = matte_source(layers, index) {
+                    is_source[source] = true;
+                }
+            }
+        }
+        for (index, is_source) in is_source.into_iter().enumerate() {
+            if !is_source {
+                self.visit_layer(layers, index, mattes, depth)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn visit_layer(
+        &mut self,
+        layers: &'a [Layer],
+        index: usize,
+        mattes: bool,
+        depth: usize,
+    ) -> Result<(), Limit> {
+        if depth > self.limits.nesting_depth {
+            return Err(Limit::NestingDepth);
+        }
+        self.layers += 1;
+        if self.layers > self.limits.layer_instances {
+            return Err(Limit::LayerInstances);
+        }
+        // A matte source is rendered once more for each layer that it mattes.
+        if mattes && let Some(source) = matte_source(layers, index) {
+            self.visit_layer(layers, source, mattes, depth + 1)?;
+        }
+        // Likewise, evaluation reports a precomposition that holds itself, and one that is
+        // missing.
+        if let Content::Instance { name, .. } = &layers[index].content
+            && !self.assets.contains(&name.as_str())
+            && let Some(children) = self.animation.assets.get(name)
+        {
+            self.assets.push(name);
+            self.visit_layers(children, depth + 1)?;
+            self.assets.pop();
+        }
+        Ok(())
+    }
+}
+
+/// What rendering a layer, or a set of layers, takes at a frame.
+#[derive(Clone, Copy, Debug, Default)]
+struct RenderCost {
+    /// Layers rendered. A matte source counts once for each layer that it mattes.
+    layers: usize,
+    /// What the shapes of those layers take.
+    shapes: ShapeCost,
+    /// Levels of nesting below, through precompositions and mattes.
+    depth: usize,
+}
+
+impl RenderCost {
+    /// Adds the cost of something that is rendered as a part of this.
+    fn nest(&mut self, inner: Self, limits: &Limits) -> Result<(), Limit> {
+        self.layers = self.layers.saturating_add(inner.layers);
+        self.depth = self.depth.max(inner.depth + 1);
+        self.shapes.add(inner.shapes, limits)?;
+        self.check(limits)
+    }
+
+    /// Adds the cost of something that is rendered next to this.
+    fn join(&mut self, other: Self, limits: &Limits) -> Result<(), Limit> {
+        self.layers = self.layers.saturating_add(other.layers);
+        self.depth = self.depth.max(other.depth);
+        self.shapes.add(other.shapes, limits)?;
+        self.check(limits)
+    }
+
+    fn check(&self, limits: &Limits) -> Result<(), Limit> {
+        if self.layers > limits.layer_instances {
+            Err(Limit::LayerInstances)
+        } else if self.depth > limits.nesting_depth {
+            Err(Limit::NestingDepth)
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -230,134 +425,255 @@ fn dependency_order(
     Ok(order)
 }
 
-fn evaluate_layers<'a>(
+/// The evaluation of a composition at a frame.
+struct Evaluation<'a> {
     animation: &'a Composition,
-    layers: &'a [Layer],
-    frame: f64,
-    outer: Affine,
-    visible: bool,
-    prefix: &mut Vec<usize>,
-    assets: &mut Vec<String>,
-) -> Result<Vec<EvaluatedLayer<'a>>, EvaluationError> {
-    if !frame.is_finite() {
-        return Err(EvaluationError::NonFiniteTime);
-    }
-    let mut result = Vec::with_capacity(layers.len());
-    for (index, layer) in layers.iter().enumerate() {
-        let mut indices = prefix.clone();
-        indices.push(index);
-        let path = OccurrencePath(indices);
-        let parent = match layer.parent {
-            Some(LayerReference::Resolved(index)) => {
-                if index >= layers.len() {
-                    return Err(EvaluationError::InvalidParent(path));
-                }
-                Some(index)
-            }
-            Some(LayerReference::Unresolved(id)) => {
-                return Err(EvaluationError::UnresolvedParent { path, id });
-            }
-            None => None,
+    limits: &'a Limits,
+    /// Layers evaluated so far.
+    layers: usize,
+    /// What the shapes take that were counted at this frame, for any layer. This stops an
+    /// evaluation that counts more than a frame may take, before it has counted it all.
+    passes: ShapeCost,
+    /// The part of `passes` for layers that are not rendered in their own right. It counts
+    /// toward the frame with what is rendered.
+    counted: ShapeCost,
+    /// Indices of the precomposition layers that hold the layers being evaluated.
+    prefix: Vec<usize>,
+    /// Their precompositions.
+    assets: Vec<String>,
+}
+
+impl<'a> Evaluation<'a> {
+    /// Evaluates the layers of the main composition or of a precomposition, and works out what
+    /// rendering them takes.
+    ///
+    /// The number of layers and their nesting are checked before anything is evaluated for
+    /// them, and the shapes of every layer are counted, so that everything this returns can be
+    /// rendered and queried within the limits.
+    ///
+    /// `active` is whether the frame is within the in and out points of every precomposition
+    /// layer that holds these layers. Layers that are not active are not rendered.
+    fn evaluate_layers(
+        &mut self,
+        layers: &'a [Layer],
+        frame: f64,
+        outer: Affine,
+        visible: bool,
+        active: bool,
+    ) -> Result<(Vec<EvaluatedLayer<'a>>, RenderCost), EvaluationError> {
+        if !frame.is_finite() {
+            return Err(EvaluationError::NonFiniteTime);
+        }
+        let limits = self.limits;
+        // The layers being evaluated are one level below the layers in `prefix`.
+        let exceeded = |limit| EvaluationError::LimitExceeded {
+            limit,
+            maximum: limits.maximum(limit),
         };
-        let matte = match layer.matte {
-            Some((mode, LayerReference::Resolved(index))) => {
-                if index >= layers.len() {
-                    return Err(EvaluationError::InvalidMatte(path));
+        if self.prefix.len() >= limits.nesting_depth {
+            return Err(exceeded(Limit::NestingDepth));
+        }
+        self.layers = self.layers.saturating_add(layers.len());
+        if self.layers > limits.layer_instances {
+            return Err(exceeded(Limit::LayerInstances));
+        }
+        let mut result = Vec::with_capacity(layers.len());
+        for (index, layer) in layers.iter().enumerate() {
+            let mut indices = self.prefix.clone();
+            indices.push(index);
+            let path = OccurrencePath(indices);
+            let parent = match layer.parent {
+                Some(LayerReference::Resolved(index)) => {
+                    if index >= layers.len() {
+                        return Err(EvaluationError::InvalidParent(path));
+                    }
+                    Some(index)
                 }
-                Some((mode, index))
-            }
-            Some((_, LayerReference::Unresolved(id))) => {
-                return Err(EvaluationError::UnresolvedMatte { path, id });
-            }
-            None => None,
-        };
-        if matches!(layer.content, Content::Instance { .. })
-            && (!layer.stretch.is_finite() || layer.stretch == 0.0)
-        {
-            return Err(EvaluationError::InvalidStretch(path));
-        }
-        let authored_components = layer.transform.components(frame);
-        let local_transform = authored_components.map_or_else(
-            || layer.transform.evaluate(frame).into_owned(),
-            TransformComponents::matrix,
-        );
-        if !local_transform.is_finite() {
-            return Err(EvaluationError::InvalidTransform(path));
-        }
-        let in_range = layer.frames.contains(&frame);
-        result.push(EvaluatedLayer {
-            path,
-            layer,
-            parent,
-            matte,
-            frame,
-            in_range,
-            visible: visible && in_range && !layer.hidden && !layer.is_matte_source,
-            authored_components,
-            local_transform,
-            full_transform: local_transform,
-            opacity: layer.opacity.evaluate(frame) / 100.0,
-            children: Vec::new(),
-        });
-    }
-    let parent_order = dependency_order(result.len(), |index| result[index].parent)
-        .map_err(|index| EvaluationError::ParentCycle(result[index].path.clone()))?;
-    for index in parent_order {
-        let parent_transform = result[index]
-            .parent
-            .map_or(outer, |parent| result[parent].full_transform);
-        let transform = parent_transform * result[index].local_transform;
-        if !transform.is_finite() {
-            return Err(EvaluationError::InvalidTransform(
-                result[index].path.clone(),
-            ));
-        }
-        result[index].full_transform = transform;
-    }
-    dependency_order(result.len(), |index| {
-        result[index].matte.map(|(_, source)| source)
-    })
-    .map_err(|index| EvaluationError::MatteCycle(result[index].path.clone()))?;
-    for node in &mut result {
-        if let Content::Instance { name, time_remap } = &node.layer.content {
-            // Keep existing tm sampling; remap only child content.
-            let child_frame = if let Some(tm) = time_remap {
-                let sample_frame = frame / node.layer.stretch - node.layer.start_frame;
-                if !sample_frame.is_finite() {
-                    return Err(EvaluationError::NonFiniteTime);
+                Some(LayerReference::Unresolved(id)) => {
+                    return Err(EvaluationError::UnresolvedParent { path, id });
                 }
-                tm.evaluate(sample_frame) * animation.frame_rate
-            } else {
-                frame / node.layer.stretch - node.layer.start_frame / node.layer.stretch
+                None => None,
             };
-            if !child_frame.is_finite() {
-                return Err(EvaluationError::NonFiniteTime);
+            let matte = match layer.matte {
+                Some((mode, LayerReference::Resolved(index))) => {
+                    if index >= layers.len() {
+                        return Err(EvaluationError::InvalidMatte(path));
+                    }
+                    Some((mode, index))
+                }
+                Some((_, LayerReference::Unresolved(id))) => {
+                    return Err(EvaluationError::UnresolvedMatte { path, id });
+                }
+                None => None,
+            };
+            if matches!(layer.content, Content::Instance { .. })
+                && (!layer.stretch.is_finite() || layer.stretch == 0.0)
+            {
+                return Err(EvaluationError::InvalidStretch(path));
             }
-            if assets.contains(name) {
-                return Err(EvaluationError::PrecompCycle(name.clone()));
+            let authored_components = layer.transform.components(frame);
+            let local_transform = authored_components.map_or_else(
+                || layer.transform.evaluate(frame).into_owned(),
+                TransformComponents::matrix,
+            );
+            if !local_transform.is_finite() {
+                return Err(EvaluationError::InvalidTransform(path));
             }
-            let children = animation
-                .assets
-                .get(name)
-                .ok_or_else(|| EvaluationError::MissingAsset(name.clone()))?;
-            assets.push(name.clone());
-            prefix.push(*node.path.0.last().unwrap());
-            node.children = evaluate_layers(
-                animation,
-                children,
-                child_frame,
-                node.full_transform,
-                node.visible,
-                prefix,
-                assets,
-            )?;
-            prefix.pop();
-            assets.pop();
-        } else if let Content::Image { asset_id } = &node.layer.content
-            && !animation.images.contains_key(asset_id)
-        {
-            return Err(EvaluationError::MissingAsset(asset_id.clone()));
+            let in_range = layer.frames.contains(&frame);
+            result.push(EvaluatedLayer {
+                path,
+                layer,
+                parent,
+                matte,
+                frame,
+                in_range,
+                visible: visible && in_range && !layer.hidden && !layer.is_matte_source,
+                authored_components,
+                local_transform,
+                full_transform: local_transform,
+                opacity: layer.opacity.evaluate(frame) / 100.0,
+                children: Vec::new(),
+            });
         }
+        let parent_order = dependency_order(result.len(), |index| result[index].parent)
+            .map_err(|index| EvaluationError::ParentCycle(result[index].path.clone()))?;
+        for index in parent_order {
+            let parent_transform = result[index]
+                .parent
+                .map_or(outer, |parent| result[parent].full_transform);
+            let transform = parent_transform * result[index].local_transform;
+            if !transform.is_finite() {
+                return Err(EvaluationError::InvalidTransform(
+                    result[index].path.clone(),
+                ));
+            }
+            result[index].full_transform = transform;
+        }
+        let matte_order = dependency_order(result.len(), |index| {
+            result[index].matte.map(|(_, source)| source)
+        })
+        .map_err(|index| EvaluationError::MatteCycle(result[index].path.clone()))?;
+        // What the content of each layer takes to render: its shapes, or the layers of its
+        // precomposition.
+        let mut contents = vec![RenderCost::default(); result.len()];
+        // Whether the shapes of each layer were counted at this frame.
+        let mut counted = vec![false; result.len()];
+        for (index, (node, content)) in result.iter_mut().zip(&mut contents).enumerate() {
+            match &node.layer.content {
+                Content::Instance { name, time_remap } => {
+                    // Keep existing tm sampling; remap only child content.
+                    let child_frame = if let Some(tm) = time_remap {
+                        let sample_frame = frame / node.layer.stretch - node.layer.start_frame;
+                        if !sample_frame.is_finite() {
+                            return Err(EvaluationError::NonFiniteTime);
+                        }
+                        tm.evaluate(sample_frame) * self.animation.frame_rate
+                    } else {
+                        frame / node.layer.stretch - node.layer.start_frame / node.layer.stretch
+                    };
+                    if !child_frame.is_finite() {
+                        return Err(EvaluationError::NonFiniteTime);
+                    }
+                    if self.assets.contains(name) {
+                        return Err(EvaluationError::PrecompCycle(name.clone()));
+                    }
+                    let children = self
+                        .animation
+                        .assets
+                        .get(name)
+                        .ok_or_else(|| EvaluationError::MissingAsset(name.clone()))?;
+                    self.assets.push(name.clone());
+                    self.prefix.push(*node.path.0.last().unwrap());
+                    (node.children, *content) = self.evaluate_layers(
+                        children,
+                        child_frame,
+                        node.full_transform,
+                        node.visible,
+                        active && node.in_range,
+                    )?;
+                    self.prefix.pop();
+                    self.assets.pop();
+                }
+                Content::Image { asset_id } => {
+                    if !self.animation.images.contains_key(asset_id) {
+                        return Err(EvaluationError::MissingAsset(asset_id.clone()));
+                    }
+                }
+                Content::Shape(shapes) => {
+                    content.shapes = match node.layer.shape_check {
+                        ShapeCheck::Never(cost) => cost,
+                        ShapeCheck::EveryFrame => {
+                            let cost =
+                                count_shapes(shapes, frame, limits).map_err(
+                                    |error| match error {
+                                        ShapeError::Limit(limit) => exceeded(limit),
+                                        ShapeError::NonFiniteSize => {
+                                            EvaluationError::InvalidShape(node.path.clone())
+                                        }
+                                    },
+                                )?;
+                            counted[index] = true;
+                            self.passes.add(cost, limits).map_err(exceeded)?;
+                            cost
+                        }
+                    };
+                }
+                Content::None => {}
+            }
+        }
+        // What each layer takes to render. A layer renders its matte source, so sources come
+        // before the layers they matte.
+        let mut rendered = vec![RenderCost::default(); result.len()];
+        let mut total = RenderCost::default();
+        for index in matte_order {
+            let node = &result[index];
+            // The paths of a layer that is not rendered can still be queried. Where counting
+            // them took a pass over the shapes at this frame, that pass is work of the frame,
+            // and is held to the limits like the rest.
+            let mut count_unrendered = || {
+                if counted[index] {
+                    self.counted
+                        .add(contents[index].shapes, limits)
+                        .map_err(exceeded)?;
+                }
+                Ok(())
+            };
+            if !(active && node.in_range) {
+                count_unrendered()?;
+                continue;
+            }
+            // Masks and effects are applied each time the layer is rendered.
+            let mut cost = RenderCost {
+                layers: 1,
+                shapes: ShapeCost {
+                    instances: node.layer.masks.len() + node.layer.effects.len(),
+                    elements: node
+                        .layer
+                        .masks
+                        .iter()
+                        .map(|mask| {
+                            mask.geometry
+                                .max_elements(frame, limits)
+                                .unwrap_or(0)
+                                .max(1)
+                        })
+                        .fold(0, usize::saturating_add),
+                    trimmed: 0,
+                },
+                depth: 0,
+            };
+            // The content of a layer and its matte source are one level below the layer.
+            let source = node.matte.map(|(_, source)| rendered[source]);
+            for inner in [Some(contents[index]), source].into_iter().flatten() {
+                cost.nest(inner, limits).map_err(exceeded)?;
+            }
+            rendered[index] = cost;
+            if node.layer.hidden || node.layer.is_matte_source {
+                count_unrendered()?;
+            } else {
+                total.join(cost, limits).map_err(exceeded)?;
+            }
+        }
+        Ok((result, total))
     }
-    Ok(result)
 }

@@ -7,6 +7,13 @@
 pub enum Error {
     Json(serde_json::Error),
     InvalidFrameRate(f64),
+    /// The animation asks for more than a [limit](crate::limits) allows, whatever the frame.
+    LimitExceeded {
+        /// The limit that is exceeded.
+        limit: crate::limits::Limit,
+        /// The most that the limit allows.
+        maximum: usize,
+    },
 }
 
 impl core::error::Error for Error {}
@@ -19,6 +26,9 @@ impl core::fmt::Display for Error {
                     f,
                     "Invalid animation frame rate {rate}: expected a finite, positive value"
                 )
+            }
+            Self::LimitExceeded { limit, maximum } => {
+                write!(f, "Lottie animation has more than {maximum} {limit}")
             }
         }
     }

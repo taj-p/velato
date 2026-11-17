@@ -32,6 +32,13 @@
 //! let scene = renderer.render_to_vello_scene(&composition, &images, frame, transform, alpha);
 //! ```
 //!
+//! # Limits
+//!
+//! An animation can ask for far more than its size suggests: repeaters multiply shapes and
+//! precompositions multiply layers. Velato limits what one frame may take, and rejects an
+//! animation that is over a limit with an error, when it is imported or when the frame is
+//! evaluated. See [`limits`].
+//!
 //! # Unsupported features
 //!
 //! Missing features include:
@@ -90,6 +97,7 @@
 )]
 
 pub(crate) mod import;
+pub mod limits;
 pub(crate) mod runtime;
 pub mod schema;
 

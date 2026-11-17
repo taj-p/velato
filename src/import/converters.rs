@@ -6,6 +6,7 @@ use super::defaults::{
     FLOAT_VALUE_ONE_HUNDRED, FLOAT_VALUE_ZERO, MULTIDIM_ONE_HUNDRED, POSITION_ZERO,
 };
 use crate::import::builders::LayerSetupParams;
+use crate::limits::{Limit, Limits};
 use crate::runtime::model::animated::{self, Position};
 use crate::runtime::model::{
     self, Content, Draw, Easing, EasingHandle, GroupTransform, Layer, RepeaterComposite,
@@ -123,6 +124,31 @@ pub fn conv_animation(source: schema::Animation) -> Result<Composition, crate::E
         unsupported_assets: Default::default(),
     };
 
+    // Converting a gradient takes time in proportion to its colour stops times its
+    // transparency stops, so their number is checked before anything is converted.
+    let limits = &Limits::DEFAULT;
+    let precompositions = source
+        .assets
+        .iter()
+        .flatten()
+        .filter_map(|asset| match asset {
+            schema::assets::AnyAsset::Precomposition(precomp) => Some(&precomp.composition.layers),
+            _ => None,
+        });
+    for layer in precompositions
+        .chain([&source.composition.layers])
+        .flatten()
+    {
+        if let AnyLayer::Shape(layer) = layer
+            && max_gradient_stops(&layer.shapes) > limits.gradient_stops
+        {
+            return Err(crate::Error::LimitExceeded {
+                limit: Limit::GradientStops,
+                maximum: limits.gradient_stops,
+            });
+        }
+    }
+
     // Collect assets and layers
     let mut idmap: HashMap<usize, usize> = HashMap::default();
 
@@ -170,6 +196,7 @@ pub fn conv_animation(source: schema::Animation) -> Result<Composition, crate::E
         &mut target.unsupported_layers,
     );
 
+    target.check_limits(limits)?;
     Ok(target)
 }
 
@@ -672,6 +699,39 @@ fn conv_gradient_colors(
             })
         }
     }
+}
+
+/// Returns the most colour stops, or transparency stops, of a gradient in `shapes`.
+fn max_gradient_stops(shapes: &[schema::shapes::AnyShape]) -> usize {
+    use schema::animated_properties::animated_property::AnimatedPropertyK::*;
+    use schema::shapes::AnyShape;
+
+    let stops = |colors: &schema::animated_properties::gradient_colors::GradientColors| {
+        // Four numbers for each colour stop, and after those two for each transparency stop.
+        let stops = |values: &[f64]| {
+            let color = colors.count.min(values.len() / 4);
+            let transparency = values.len().saturating_sub(colors.count.saturating_mul(4)) / 2;
+            color.max(transparency)
+        };
+        match &colors.colors.animated_property.value {
+            Static(values) => stops(values),
+            AnimatedValue(keyframes) => keyframe_values(keyframes.iter())
+                .into_iter()
+                .map(stops)
+                .max()
+                .unwrap_or(0),
+        }
+    };
+    shapes
+        .iter()
+        .map(|shape| match shape {
+            AnyShape::Group(group) => max_gradient_stops(&group.shapes),
+            AnyShape::GradientFill(fill) => stops(&fill.gradient.colors),
+            AnyShape::GradientStroke(stroke) => stops(&stroke.gradient.colors),
+            _ => 0,
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 fn conv_fill_rule(rule: Option<&schema::constants::fill_rule::FillRule>) -> Fill {
@@ -1889,36 +1949,6 @@ mod tests {
             value: ShapePropertyK::Animated(vec![keyframe(0.0), keyframe(10.0)]),
         };
         assert!(super::conv_shape_geometry(&property).is_none());
-    }
-
-    fn polystar(star_type: u8, points: serde_json::Value) -> serde_json::Value {
-        json!({
-            "ty": "sr",
-            "sy": star_type,
-            "p": { "a": 0, "k": [50, 50] },
-            "or": { "a": 0, "k": 20 },
-            "os": { "a": 0, "k": 0 },
-            "ir": { "a": 0, "k": 10 },
-            "is": { "a": 0, "k": 0 },
-            "r": { "a": 0, "k": 0 },
-            "pt": points,
-        })
-    }
-
-    #[test]
-    fn polystar_with_too_many_points_has_no_outline() {
-        use crate::test_support::*;
-        let animated = json!({ "a": 1, "k": [{ "t": 0, "s": [1e30] }, { "t": 10, "s": [1e30] }] });
-        for points in [json!({ "a": 0, "k": 1e30 }), animated] {
-            for star_type in [1, 2] {
-                let shapes = json!([polystar(star_type, points.clone()), fill(100.0)]);
-                let composition = composition(json!([shape_layer(1, shapes)]));
-                assert_eq!(trace(&composition, 0.0), ["clip", "pop"]);
-            }
-        }
-        let shapes = json!([polystar(1, json!({ "a": 0, "k": 5 })), fill(100.0)]);
-        let composition = composition(json!([shape_layer(1, shapes)]));
-        assert_eq!(trace(&composition, 0.0), ["clip", "fill(1)", "pop"]);
     }
 
     #[test]

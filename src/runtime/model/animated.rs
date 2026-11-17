@@ -108,8 +108,16 @@ pub struct Ellipse {
 }
 
 impl Ellipse {
+    /// The most elements an ellipse evaluates to, at any size.
+    pub(crate) const MAX_ELEMENTS: usize = 16;
+
     pub fn is_fixed(&self) -> bool {
         self.position.is_fixed() && self.size.is_fixed()
+    }
+
+    /// Whether the size of the ellipse is finite at this frame.
+    pub(crate) fn has_finite_size(&self, frame: f64) -> bool {
+        self.size.evaluate(frame).is_finite()
     }
 
     #[cfg(not(feature = "lottie-shape-paths"))]
@@ -158,9 +166,17 @@ pub struct Rect {
 }
 
 impl Rect {
+    /// The most elements a rectangle evaluates to, at any size.
+    pub(crate) const MAX_ELEMENTS: usize = 24;
+
     /// Returns true if the rectangle is fixed.
     pub fn is_fixed(&self) -> bool {
         self.position.is_fixed() && self.size.is_fixed() && self.corner_radius.is_fixed()
+    }
+
+    /// Whether the size and the corner radius of the rectangle are finite at this frame.
+    pub(crate) fn has_finite_size(&self, frame: f64) -> bool {
+        self.size.evaluate(frame).is_finite() && self.corner_radius.evaluate(frame).is_finite()
     }
 
     #[cfg(not(feature = "lottie-shape-paths"))]
@@ -249,14 +265,38 @@ impl Star {
             && self.points.is_fixed()
     }
 
+    /// A fixed star or polygon with at most this many points is turned into a path when it is
+    /// imported. One with more points is evaluated when it is drawn, so that the memory an
+    /// imported animation takes stays in proportion to the size of its file.
+    const MAX_PRECOMPUTED_POINTS: usize = 64;
+
+    /// Returns the number of points at the given frame.
+    pub(crate) fn point_count(&self, frame: f64) -> usize {
+        self.points.evaluate(frame).round() as usize
+    }
+
+    /// Returns the most elements a star or polygon with this many points evaluates to.
+    pub(crate) fn max_elements(&self, points: usize) -> usize {
+        let vertices = if self.is_polygon {
+            points
+        } else {
+            points.saturating_mul(2)
+        };
+        vertices.saturating_add(2)
+    }
+
     /// Evaluates the star or polygon at the given frame and emits the
     /// elements to the specified path.
+    ///
+    /// Emits nothing if there are more points than
+    /// [`MAX_POLYSTAR_POINTS`](crate::limits::MAX_POLYSTAR_POINTS). Evaluating a composition
+    /// with such a star or polygon fails, so it is not drawn without them.
     pub fn evaluate(&self, frame: f64, path: &mut Vec<PathEl>) {
         use std::f64::consts::{FRAC_PI_2, TAU};
 
         let center = self.position.evaluate(frame);
-        let num_points = self.points.evaluate(frame).round() as usize;
-        if num_points == 0 {
+        let num_points = self.point_count(frame);
+        if num_points == 0 || num_points > crate::limits::MAX_POLYSTAR_POINTS {
             return;
         }
         let rotation_deg = self.rotation.evaluate(frame);
@@ -284,11 +324,7 @@ impl Star {
         };
         let vertex_angle_step = if is_star { half_angle } else { angle_per_point };
 
-        let mut vertices: Vec<(Point, Point, Point)> = Vec::new();
-        // A point count that is too large to hold in memory has no outline.
-        if vertices.try_reserve_exact(total_vertices).is_err() {
-            return;
-        }
+        let mut vertices: Vec<(Point, Point, Point)> = Vec::with_capacity(total_vertices);
         let mut current_angle = rotation_rad;
 
         for i in 0..total_vertices {
@@ -321,9 +357,7 @@ impl Star {
             return;
         }
 
-        if path.try_reserve(total_vertices.saturating_add(2)).is_err() {
-            return;
-        }
+        path.reserve(total_vertices + 2);
         path.push(PathEl::MoveTo(vertices[0].0));
         for i in 1..vertices.len() {
             let prev_out = vertices[i - 1].2;
@@ -356,7 +390,7 @@ impl Star {
 
     /// Converts the animated value to its model representation.
     pub fn into_model(self) -> super::Geometry {
-        if self.is_fixed() {
+        if self.is_fixed() && self.point_count(0.0) <= Self::MAX_PRECOMPUTED_POINTS {
             let mut path = Vec::new();
             self.evaluate(0.0, &mut path);
             super::Geometry::Fixed(path)
@@ -386,6 +420,34 @@ pub struct SplineKeyframeValues {
 }
 
 impl Spline {
+    /// Returns the most elements the spline evaluates to at the given frame.
+    pub(crate) fn max_elements(&self, frame: f64) -> usize {
+        let Some(([ix0, ix1], ..)) = Time::frames_and_weight(&self.times, frame) else {
+            return 0;
+        };
+        let (Some(from), Some(to)) = (self.values.get(ix0), self.values.get(ix1)) else {
+            return 0;
+        };
+        let points = from
+            .start
+            .len()
+            .min(from.end.as_ref().unwrap_or(&to.start).len());
+        // A move, a segment between each two vertices, and a closing segment and close.
+        points / 3 + 2
+    }
+
+    /// Whether every keyframe has the same number of points, so that the spline evaluates to
+    /// the same number of elements at every frame.
+    pub(crate) fn has_fixed_point_count(&self) -> bool {
+        let mut counts = self
+            .values
+            .iter()
+            .flat_map(|value| [Some(value.start.len()), value.end.as_ref().map(Vec::len)])
+            .flatten();
+        let first = counts.next();
+        counts.all(|count| Some(count) == first)
+    }
+
     /// Evaluates the spline at the given frame and emits the elements
     /// to the specified path.
     pub fn evaluate(&self, frame: f64, path: &mut Vec<PathEl>) -> bool {
@@ -445,9 +507,14 @@ impl Repeater {
             && self.end_opacity.is_fixed()
     }
 
+    /// Returns the number of copies at the specified frame.
+    pub(crate) fn copy_count(&self, frame: f64) -> usize {
+        self.copies.evaluate(frame).round() as usize
+    }
+
     /// Evaluates the repeater at the specified frame.
     pub fn evaluate(&self, frame: f64) -> fixed::Repeater {
-        let copies = self.copies.evaluate(frame).round() as usize;
+        let copies = self.copy_count(frame);
         let offset = self.offset.evaluate(frame);
         let anchor_point = self.anchor_point.evaluate(frame);
         let position = self.position.evaluate(frame);

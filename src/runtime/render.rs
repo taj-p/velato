@@ -2,13 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 use super::model::{
-    Content, Draw, Geometry, GroupTransform, ImageAsset, Layer, RepeaterComposite, Shape, fixed,
+    Content, Draw, Geometry, GroupTransform, ImageAsset, Layer, Repeater, RepeaterComposite, Shape,
+    fixed,
 };
 use super::trim::Measured;
 use super::{
     Composition, EvaluatedComposition, EvaluatedLayer, EvaluationError, FilterEffect,
     FilterLayerResult,
 };
+use crate::limits::{Limit, Limits, ShapeCost, ShapeCount, ShapeError};
 use kurbo::{Affine, PathEl, Rect};
 use peniko::{Fill, Mix};
 use std::collections::HashMap;
@@ -80,10 +82,9 @@ impl Renderer {
 
     /// Renders and appends the animation at a given frame to the provided scene.
     ///
-    /// Panics on evaluation errors. Use [`Self::try_append`] to handle them explicitly.
-    ///
-    /// Repeater expansion is unbounded. Callers handling untrusted animations should validate copy
-    /// counts and nesting, and benchmark representative workloads to establish their own limits.
+    /// Panics on evaluation errors, which include an animation that asks for more at this frame
+    /// than the [limits](crate::limits) allow. Use [`Self::try_append`] to handle them
+    /// explicitly.
     pub fn append(
         &mut self,
         animation: &Composition,
@@ -97,6 +98,9 @@ impl Renderer {
     }
 
     /// Renders a frame, leaving the sink unchanged if evaluation fails.
+    ///
+    /// Evaluation fails for an animation that asks for more at this frame than the
+    /// [limits](crate::limits) allow.
     pub fn try_append(
         &mut self,
         animation: &Composition,
@@ -517,15 +521,40 @@ struct Batch {
     repeat_draws: Vec<DrawData>,
     next_scope: usize,
     trim_elements: Vec<PathEl>,
+    /// What the shapes evaluated so far take, in the units of the limits.
+    count: ShapeCount,
+    /// Number of groups that hold the shapes being evaluated.
+    group_depth: usize,
 }
 
+/// What an evaluation of shapes is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Purpose {
+    /// Paths and styles, to draw them.
+    Draw,
+    /// Paths only.
+    Paths,
+    /// Nothing but the count of what the shapes take. Nothing is stored.
+    Count,
+}
+
+/// Returns the paths of a layer, or nothing if its shapes are over a limit.
+///
+/// [`Composition::evaluate`](crate::Composition::evaluate) fails for a layer whose shapes are
+/// over a limit, so the layers it returns have paths.
 pub(crate) fn evaluate_paths(
     shapes: &[Shape],
     transform: Affine,
     frame: f64,
 ) -> Vec<kurbo::BezPath> {
     let mut batch = Batch::default();
-    batch.evaluate_shapes(shapes, transform, frame, false, false);
+    let purpose = Purpose::Paths;
+    if batch
+        .evaluate_shapes(shapes, transform, frame, purpose, false, &Limits::DEFAULT)
+        .is_err()
+    {
+        return Vec::new();
+    }
     batch
         .geometries
         .iter()
@@ -539,23 +568,115 @@ pub(crate) fn evaluate_paths(
         .collect()
 }
 
+/// Counts what the shapes of a layer take to evaluate and draw at a frame, without evaluating
+/// more than the values that decide it. Fails if that is over a limit.
+pub(crate) fn count_shapes(
+    shapes: &[Shape],
+    frame: f64,
+    limits: &Limits,
+) -> Result<ShapeCost, ShapeError> {
+    let mut batch = Batch::default();
+    let purpose = Purpose::Count;
+    batch.evaluate_shapes(shapes, Affine::IDENTITY, frame, purpose, false, limits)?;
+    Ok(batch.count.cost())
+}
+
+/// Checks the shapes that are the same at every frame against the limits on a single shape,
+/// and returns whether what the shapes take is the same at every frame. It is not if a number
+/// that decides it is animated, or a size that may not be finite at some frame.
+///
+/// `depth` is the number of groups that hold the shapes.
+pub(crate) fn check_fixed_shapes(
+    shapes: &[Shape],
+    limits: &Limits,
+    depth: usize,
+) -> Result<bool, ShapeError> {
+    let mut fixed = true;
+    for shape in shapes {
+        let shape = match shape {
+            Shape::Hidden(shape) => shape.as_ref(),
+            shape => shape,
+        };
+        fixed &= match shape {
+            // Nothing wraps a hidden shape a second time.
+            Shape::Hidden(_) => true,
+            Shape::Group(shapes, _) => {
+                if depth >= limits.group_depth {
+                    return Err(Limit::GroupDepth.into());
+                }
+                check_fixed_shapes(shapes, limits, depth + 1)?
+            }
+            Shape::Geometry(geometry) => {
+                let fixed = geometry.has_fixed_size();
+                if fixed {
+                    geometry.max_elements(0.0, limits)?;
+                }
+                fixed
+            }
+            Shape::Repeater(repeater) => {
+                let copies = match repeater {
+                    Repeater::Fixed(repeater) => Some(repeater.copies),
+                    Repeater::Animated(repeater) if repeater.copies.is_fixed() => {
+                        Some(repeater.copy_count(0.0))
+                    }
+                    Repeater::Animated(_) => None,
+                };
+                match copies {
+                    Some(copies) if copies > limits.repeater_copies => {
+                        return Err(Limit::RepeaterCopies.into());
+                    }
+                    Some(_) => true,
+                    None => false,
+                }
+            }
+            Shape::Draw(draw) => {
+                if draw.brush.max_color_stops() > limits.gradient_stops {
+                    return Err(Limit::GradientStops.into());
+                }
+                true
+            }
+            Shape::Trim(_) => true,
+        };
+    }
+    Ok(fixed)
+}
+
 impl Batch {
     /// Evaluates the shapes of a layer and works out the draw calls they need.
-    fn evaluate(&mut self, shapes: &[Shape], transform: Affine, frame: f64) {
-        self.evaluate_shapes(shapes, transform, frame, true, false);
+    ///
+    /// Fails, with nothing evaluated, if the shapes are over a limit. That does not happen for
+    /// a layer of a composition that was evaluated at this frame, which counts the shapes.
+    fn evaluate(&mut self, shapes: &[Shape], transform: Affine, frame: f64) -> bool {
+        let purpose = Purpose::Draw;
+        if self
+            .evaluate_shapes(shapes, transform, frame, purpose, false, &Limits::DEFAULT)
+            .is_err()
+        {
+            self.clear();
+            return false;
+        }
         self.collect_calls();
+        true
     }
 
+    /// Evaluates shapes for a purpose.
+    ///
+    /// Whatever the purpose, what the shapes take is counted first and checked against the
+    /// limits before anything is evaluated or stored, so a count on its own tells whether an
+    /// evaluation is going to succeed.
     fn evaluate_shapes(
         &mut self,
         shapes: &[Shape],
         transform: Affine,
         frame: f64,
-        collect_draws: bool,
+        purpose: Purpose,
         hidden: bool,
-    ) {
+        limits: &Limits,
+    ) -> Result<(), ShapeError> {
         let geometry_start = self.geometries.len();
         let draw_start = self.draws.len();
+        let count_start = self.count;
+        let stores = purpose != Purpose::Count;
         for shape in shapes {
             // A hidden shape is not drawn. Its geometry is still evaluated: it is part of the
             // layer's paths, and it takes its share of a trim that also covers visible paths.
@@ -563,26 +684,30 @@ impl Batch {
                 Shape::Hidden(shape) => (shape.as_ref(), true),
                 shape => (shape, hidden),
             };
-            let collect_draws = collect_draws && !hidden;
+            let collect_draws = purpose == Purpose::Draw && !hidden;
             match shape {
                 // Nothing wraps a hidden shape a second time.
                 Shape::Hidden(_) => {}
                 Shape::Group(shapes, group_transform) => {
-                    let (group_transform, group_alpha) =
-                        if let Some(GroupTransform { transform, opacity }) = group_transform {
-                            (
-                                transform.evaluate(frame).into_owned(),
-                                if collect_draws {
-                                    unit_alpha(opacity.evaluate(frame) / 100.0)
-                                } else {
-                                    1.0
-                                },
-                            )
-                        } else {
-                            (Affine::IDENTITY, 1.0)
-                        };
+                    if self.group_depth >= limits.group_depth {
+                        return Err(Limit::GroupDepth.into());
+                    }
+                    self.count.item(limits)?;
+                    let (group_transform, group_alpha) = match group_transform {
+                        Some(GroupTransform { transform, opacity }) if stores => (
+                            transform.evaluate(frame).into_owned(),
+                            if collect_draws {
+                                unit_alpha(opacity.evaluate(frame) / 100.0)
+                            } else {
+                                1.0
+                            },
+                        ),
+                        _ => (Affine::IDENTITY, 1.0),
+                    };
                     let group_draws = self.draws.len();
-                    self.evaluate_shapes(shapes, group_transform, frame, collect_draws, hidden);
+                    self.group_depth += 1;
+                    self.evaluate_shapes(shapes, group_transform, frame, purpose, hidden, limits)?;
+                    self.group_depth -= 1;
                     if group_alpha != 1.0 {
                         let scope = OpacityScope {
                             id: self.next_scope,
@@ -595,20 +720,57 @@ impl Batch {
                     }
                 }
                 Shape::Geometry(geometry) => {
-                    self.push_geometry(geometry, Affine::IDENTITY, frame, hidden);
+                    let max_elements = geometry.max_elements(frame, limits)?;
+                    self.count.geometry(max_elements, limits)?;
+                    if stores {
+                        self.push_geometry(geometry, Affine::IDENTITY, frame, hidden);
+                        debug_assert!(
+                            self.geometries.last().unwrap().elements.len() <= max_elements.max(1),
+                            "geometry has more elements than it was counted for"
+                        );
+                    }
                 }
                 Shape::Draw(draw) => {
+                    // Hidden styles are counted like the rest, which keeps the count simple.
+                    if draw.brush.max_color_stops() > limits.gradient_stops {
+                        return Err(Limit::GradientStops.into());
+                    }
+                    let paint_elements = draw.max_paint_elements();
+                    self.count.draw(&count_start, paint_elements, limits)?;
                     if collect_draws {
                         self.push_draw(draw, geometry_start, frame);
                     }
                 }
                 Shape::Repeater(repeater) => {
-                    let repeater = repeater.evaluate(frame);
-                    self.repeat(repeater.as_ref(), geometry_start, draw_start);
+                    let copies = match repeater {
+                        Repeater::Fixed(repeater) => repeater.copies,
+                        Repeater::Animated(repeater) => repeater.copy_count(frame),
+                    };
+                    if copies > limits.repeater_copies {
+                        return Err(Limit::RepeaterCopies.into());
+                    }
+                    self.count.item(limits)?;
+                    self.count.repeat(&count_start, copies, limits)?;
+                    if stores {
+                        let repeater = repeater.evaluate(frame);
+                        self.repeat(repeater.as_ref(), geometry_start, draw_start);
+                    }
                 }
                 Shape::Trim(trim) => {
-                    let trim = trim.evaluate(frame);
-                    self.apply_trim(trim.as_ref(), geometry_start);
+                    self.count.item(limits)?;
+                    self.count.trim(&count_start, limits)?;
+                    if stores {
+                        let trim = trim.evaluate(frame);
+                        self.apply_trim(trim.as_ref(), geometry_start);
+                        debug_assert!(
+                            self.geometries
+                                .iter()
+                                .map(|geometry| geometry.elements.len().max(1))
+                                .sum::<usize>()
+                                <= self.count.elements(),
+                            "trimmed paths have more elements than they were counted for"
+                        );
+                    }
                 }
             }
         }
@@ -618,6 +780,7 @@ impl Batch {
         for draw in &mut self.draws[draw_start..] {
             draw.transform = transform * draw.transform;
         }
+        Ok(())
     }
 
     fn push_geometry(&mut self, geometry: &Geometry, transform: Affine, frame: f64, hidden: bool) {
@@ -649,18 +812,10 @@ impl Batch {
         ));
     }
 
+    /// Repeats the geometry and styles of a group. The caller has checked that the copies are
+    /// within the limits.
     fn repeat(&mut self, repeater: &fixed::Repeater, geometry_start: usize, draw_start: usize) {
-        // A copy count whose geometry is too large to hold in memory draws nothing, like no copies.
         let geometry_count = self.geometries.len() - geometry_start;
-        let fits = repeater
-            .copies
-            .checked_mul(geometry_count)
-            .is_some_and(|total| self.geometries.try_reserve(total).is_ok());
-        if !fits {
-            self.geometries.truncate(geometry_start);
-            self.draws.truncate(draw_start);
-            return;
-        }
         if repeater.copies == 0 {
             // Without copies the styles before the repeater draw nothing. The source geometry
             // stays where it is for the styles after the repeater.
@@ -953,13 +1108,15 @@ impl Batch {
         self.repeat_draws.clear();
         self.next_scope = 0;
         self.trim_elements.clear();
+        self.count = ShapeCount::default();
+        self.group_depth = 0;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::test_support::*;
-    use kurbo::Rect;
+    use kurbo::{Affine, Rect};
     use peniko::{BlendMode, Compose, Fill, Mix};
     use serde_json::json;
 
@@ -1859,19 +2016,121 @@ mod tests {
     }
 
     #[test]
-    fn repeater_with_too_many_copies_draws_nothing() {
-        let mut too_many = repeater(1, 10.0, 100.0, 100.0);
-        too_many["c"]["k"] = json!(1e30);
+    fn counting_shapes_agrees_with_evaluating_them() {
+        use super::{Batch, Purpose, count_shapes};
+        use crate::limits::Limits;
+        use crate::model::Content;
+
+        let trim = |mode: u8| {
+            json!({
+                "ty": "tm",
+                "s": { "a": 0, "k": 0 },
+                "e": { "a": 0, "k": 50 },
+                "o": { "a": 0, "k": 270 },
+                "m": mode,
+            })
+        };
+        let hidden = |shape: serde_json::Value| with(shape, json!({ "hd": true }));
+        let square = || rect(0.0, 0.0, 10.0, 10.0);
+        let documents = [
+            json!([square(), fill(100.0), stroke(100.0)]),
+            json!([square(), fill(100.0), repeater(3, 20.0, 100.0, 50.0)]),
+            json!([square(), repeater(3, 20.0, 100.0, 50.0), fill(100.0)]),
+            json!([
+                square(),
+                fill(100.0),
+                repeater(0, 20.0, 100.0, 100.0),
+                stroke(100.0)
+            ]),
+            json!([square(), stroke(100.0), trim(1), fill(100.0), trim(2)]),
+            json!([
+                group(
+                    vec![square(), fill(100.0), repeater(2, 20.0, 100.0, 100.0)],
+                    50.0
+                ),
+                group(vec![square(), trim(1), stroke(100.0)], 100.0),
+                repeater(2, 0.0, 100.0, 100.0),
+                trim(2),
+                gradient("gf", 100.0),
+            ]),
+            json!([
+                hidden(square()),
+                square(),
+                hidden(fill(100.0)),
+                stroke(100.0),
+                trim(2)
+            ]),
+            json!([
+                hidden(group(vec![square(), fill(100.0)], 100.0)),
+                square(),
+                fill(100.0)
+            ]),
+        ];
+        let limits = &Limits::DEFAULT;
+        for document in documents {
+            let composition = composition(json!([shape_layer(1, document.clone())]));
+            let Content::Shape(shapes) = &composition.layers[0].content else {
+                panic!("not a shape layer");
+            };
+            let counted = count_shapes(shapes, 0.0, limits).unwrap();
+            for purpose in [Purpose::Draw, Purpose::Paths] {
+                let mut batch = Batch::default();
+                batch
+                    .evaluate_shapes(shapes, Affine::IDENTITY, 0.0, purpose, false, limits)
+                    .unwrap();
+                assert_eq!(batch.count.cost(), counted, "{document}");
+                // The count is an upper bound of what was stored.
+                let elements = |geometries: &[super::GeometryData]| -> usize {
+                    geometries
+                        .iter()
+                        .map(|geometry| geometry.elements.len())
+                        .sum()
+                };
+                let drawn: usize = batch
+                    .draws
+                    .iter()
+                    .map(|draw| elements(&batch.geometries[draw.geometry.clone()]))
+                    .sum();
+                assert!(
+                    batch.geometries.len() + batch.draws.len() <= counted.instances,
+                    "{document}"
+                );
+                assert!(
+                    elements(&batch.geometries) + drawn <= counted.elements,
+                    "{document}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shapes_over_a_limit_are_refused_before_they_are_stored() {
+        use super::{Batch, Purpose};
+        use crate::limits::{Limit, Limits, ShapeError};
+        use crate::model::Content;
+
         let shapes = json!([
             rect(0.0, 0.0, 10.0, 10.0),
-            rect(20.0, 0.0, 30.0, 10.0),
             fill(100.0),
-            too_many,
+            repeater(1000, 1.0, 100.0, 100.0),
         ]);
-        assert_eq!(
-            trace(&composition(json!([shape_layer(1, shapes)])), 0.0),
-            ["clip", "pop"]
-        );
+        let composition = composition(json!([shape_layer(1, shapes)]));
+        let Content::Shape(shapes) = &composition.layers[0].content else {
+            panic!("not a shape layer");
+        };
+        let limits = Limits {
+            shape_instances: 100,
+            ..Limits::DEFAULT
+        };
+        for purpose in [Purpose::Draw, Purpose::Paths, Purpose::Count] {
+            let mut batch = Batch::default();
+            assert_eq!(
+                batch.evaluate_shapes(shapes, Affine::IDENTITY, 0.0, purpose, false, &limits),
+                Err(ShapeError::Limit(Limit::ShapeInstances))
+            );
+            // The rectangle and the fill, and none of the copies.
+            assert!(batch.geometries.len() <= 1 && batch.draws.len() <= 1);
+        }
     }
 
     #[test]
