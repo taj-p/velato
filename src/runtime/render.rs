@@ -15,7 +15,8 @@ use std::ops::Range;
 
 pub trait RenderSink {
     /// Begins a layer that is composited onto what is below it, with `blend` and `alpha`, when it
-    /// is popped. Content drawn into the layer is clipped to `shape`.
+    /// is popped. Content drawn into the layer is clipped to `shape`, and blends only with other
+    /// content of the layer.
     fn push_layer(
         &mut self,
         blend: impl Into<peniko::BlendMode>,
@@ -57,6 +58,8 @@ pub trait RenderSink {
 #[derive(Debug, Default)]
 pub struct Renderer {
     batch: Batch,
+    /// Batches to reuse while the shapes of one layer are held for another layer to render.
+    spare_batches: Vec<Batch>,
     mask_elements: Vec<PathEl>,
 }
 
@@ -119,8 +122,10 @@ impl Renderer {
         let clip = Rect::new(0.0, 0.0, animation.width as _, animation.height as _);
         let clip_bounds = transform.transform_rect_bbox(clip);
         // The caller's opacity applies to the animation as a whole, so layers that may overlap
-        // are composited first. That layer also serves as the composition clip.
-        let isolate_opacity = alpha != 1.0 && drawing_layers(&evaluated.layers) > 1;
+        // are composited first, and layers with a blend mode blend with the animation only.
+        // That layer also serves as the composition clip.
+        let isolate_opacity = (alpha != 1.0 && drawing_layers(&evaluated.layers) > 1)
+            || self.has_blending_layer(animation, &evaluated.layers, transform);
         if isolate_opacity {
             scene.push_layer(Mix::Normal, alpha as f32, transform, &clip);
         } else {
@@ -172,11 +177,37 @@ impl Renderer {
         let parent_transform = output_transform;
         let transform = output_transform * evaluated.full_transform;
         let full_rect = Rect::new(0.0, 0.0, animation.width as f64, animation.height as f64);
-        if let Some((mode, mask_index)) = evaluated.matte {
-            // The matte is applied inside a layer of its own, which can carry the opacity of
-            // the matted layer as well.
-            scene.push_layer(Mix::Normal, alpha as f32, parent_transform, &full_rect);
+        // Shapes are evaluated before anything is pushed, so that the number of draw calls is
+        // known.
+        let draw_calls = match &layer.content {
+            Content::None => 0,
+            Content::Instance { .. } => drawing_layers(&evaluated.children),
+            Content::Image { asset_id } => usize::from(animation.images.contains_key(asset_id)),
+            Content::Shape(shapes) => {
+                self.batch.evaluate(shapes, transform, frame);
+                self.batch.draw_calls()
+            }
+        };
+        // A blend mode composites the layer as a whole, and a track matte is applied inside a
+        // layer of its own. One layer serves both and carries the opacity of the layer as well.
+        // A layer that draws nothing has nothing to blend.
+        let draws = match &layer.content {
+            Content::Instance { .. } if layer.blend_mode.is_some() => {
+                self.any_layer_draws(animation, &evaluated.children, output_transform)
+            }
+            _ => draw_calls > 0,
+        };
+        let blend = layer.blend_mode.filter(|_| draws);
+        let grouped = blend.is_some() || evaluated.matte.is_some();
+        if grouped {
+            let blend = blend.unwrap_or(Mix::Normal.into());
+            scene.push_layer(blend, alpha as f32, parent_transform, &full_rect);
             alpha = 1.0;
+        }
+        if let Some((mode, mask_index)) = evaluated.matte {
+            // The matte source evaluates shapes of its own, so those of this layer are set aside.
+            let spare = self.spare_batches.pop().unwrap_or_default();
+            let batch = std::mem::replace(&mut self.batch, spare);
             // The matte source is not content of this layer, so it does not take its opacity.
             self.render_layer(
                 animation,
@@ -188,24 +219,22 @@ impl Renderer {
                 clip_bounds,
                 scene,
             );
+            let spare = std::mem::replace(&mut self.batch, batch);
+            self.spare_batches.push(spare);
             scene.push_layer(mode, 1.0, parent_transform, &full_rect);
         }
 
-        let draw_calls = match &layer.content {
-            Content::None => 0,
-            Content::Instance { .. } => drawing_layers(&evaluated.children),
-            Content::Image { asset_id } => usize::from(animation.images.contains_key(asset_id)),
-            Content::Shape(shapes) => {
-                self.batch.evaluate(shapes, transform, frame);
-                self.batch.draw_calls()
-            }
-        };
+        // Layers of a precomposition that have a blend mode blend with the precomposition only.
+        let isolate_blending = !grouped
+            && matches!(layer.content, Content::Instance { .. })
+            && self.has_blending_layer(animation, &evaluated.children, output_transform);
 
         // Opacity applies to the layer as a whole and to the output of its effects, so content
         // that may overlap itself is composited first. A single draw call gives the same result
         // with the opacity in its brush, and a precomposition with a single drawing layer by
         // handing the opacity to that layer; neither needs a layer.
-        let isolate_opacity = alpha != 1.0 && (!layer.effects.is_empty() || draw_calls > 1);
+        let isolate_opacity =
+            (alpha != 1.0 && (!layer.effects.is_empty() || draw_calls > 1)) || isolate_blending;
 
         if isolate_opacity {
             scene.push_layer(Mix::Normal, alpha as f32, parent_transform, &full_rect);
@@ -270,10 +299,60 @@ impl Renderer {
                 self.batch.clear();
             }
         }
-        for _ in 0..layer.masks.len() + filter_layers + (evaluated.matte.is_some() as usize * 2) {
+        let group_layers = usize::from(grouped) + usize::from(evaluated.matte.is_some());
+        for _ in 0..layer.masks.len() + filter_layers + group_layers {
             scene.pop_layer();
         }
         scene.end_layer_group();
+    }
+
+    /// Whether a layer that draws at this frame has a blend mode.
+    fn has_blending_layer(
+        &mut self,
+        animation: &Composition,
+        layers: &[EvaluatedLayer<'_>],
+        output_transform: Affine,
+    ) -> bool {
+        layers.iter().any(|evaluated| {
+            evaluated.layer.blend_mode.is_some()
+                && may_draw(evaluated)
+                && self.layer_draws(animation, evaluated, output_transform)
+        })
+    }
+
+    fn any_layer_draws(
+        &mut self,
+        animation: &Composition,
+        layers: &[EvaluatedLayer<'_>],
+        output_transform: Affine,
+    ) -> bool {
+        layers.iter().any(|evaluated| {
+            may_draw(evaluated) && self.layer_draws(animation, evaluated, output_transform)
+        })
+    }
+
+    /// Whether the content of a layer makes at least one draw call. This evaluates the shapes
+    /// of a shape layer, so it is only asked of layers with a blend mode.
+    fn layer_draws(
+        &mut self,
+        animation: &Composition,
+        evaluated: &EvaluatedLayer<'_>,
+        output_transform: Affine,
+    ) -> bool {
+        match &evaluated.layer.content {
+            Content::None => false,
+            Content::Instance { .. } => {
+                self.any_layer_draws(animation, &evaluated.children, output_transform)
+            }
+            Content::Image { asset_id } => animation.images.contains_key(asset_id),
+            Content::Shape(shapes) => {
+                let transform = output_transform * evaluated.full_transform;
+                self.batch.evaluate(shapes, transform, evaluated.frame);
+                let draws = self.batch.draw_calls() > 0;
+                self.batch.clear();
+                draws
+            }
+        }
     }
 }
 
@@ -289,17 +368,16 @@ fn unit_alpha(alpha: f64) -> f64 {
 /// Counts the layers that may draw at this frame. Opacity shared by more than one of them has to
 /// be composited for all of them together.
 fn drawing_layers(layers: &[EvaluatedLayer<'_>]) -> usize {
-    layers
-        .iter()
-        .filter(|evaluated| {
-            let layer = evaluated.layer;
-            evaluated.in_range
-                && !layer.hidden
-                && !layer.is_matte_source
-                && evaluated.opacity > 0.0
-                && !matches!(layer.content, Content::None)
-        })
-        .count()
+    layers.iter().filter(|layer| may_draw(layer)).count()
+}
+
+fn may_draw(evaluated: &EvaluatedLayer<'_>) -> bool {
+    let layer = evaluated.layer;
+    evaluated.in_range
+        && !layer.hidden
+        && !layer.is_matte_source
+        && evaluated.opacity > 0.0
+        && !matches!(layer.content, Content::None)
 }
 
 #[derive(Clone, Debug)]
@@ -1623,5 +1701,233 @@ mod tests {
             panic!("expected a draw call, got {events:?}");
         };
         assert!(bounds.x0 > 1e24 && bounds.x1 < 9e24, "{bounds:?}");
+    }
+
+    /// A shape layer with one fill and the given blend mode (`bm`).
+    fn blended_layer(ind: u32, mode: u8) -> serde_json::Value {
+        with(
+            shape_layer(ind, json!([rect(0.0, 0.0, 20.0, 20.0), fill(100.0)])),
+            json!({ "bm": mode }),
+        )
+    }
+
+    #[test]
+    fn layer_with_blend_mode_is_composited_with_it() {
+        let plain = shape_layer(2, json!([rect(0.0, 0.0, 20.0, 20.0), fill(100.0)]));
+        let composition = composition(json!([blended_layer(1, 1), plain]));
+        let events = render(&composition, 0.0, 1.0);
+        // The animation is isolated so that the layer blends with the animation only. That
+        // layer takes the place of the composition clip.
+        assert_eq!(
+            events[0],
+            Event::PushLayer {
+                blend: Mix::Normal.into(),
+                alpha: 1.0,
+                bounds: Rect::new(0.0, 0.0, 100.0, 100.0),
+            }
+        );
+        assert_eq!(
+            trace(&composition, 0.0),
+            [
+                "layer(1)",
+                "fill(1)",
+                "layer(1, Multiply)",
+                "fill(1)",
+                "pop",
+                "pop"
+            ]
+        );
+    }
+
+    #[test]
+    fn add_blend_mode_sums_colors() {
+        let composition = composition(json!([blended_layer(1, 16)]));
+        assert_eq!(
+            trace(&composition, 0.0),
+            ["layer(1)", "layer(1, PlusLighter)", "fill(1)", "pop", "pop"]
+        );
+    }
+
+    #[test]
+    fn hard_mix_blend_mode_renders_as_normal() {
+        let composition = composition(json!([blended_layer(1, 17)]));
+        assert_eq!(trace(&composition, 0.0), ["clip", "fill(1)", "pop"]);
+    }
+
+    #[test]
+    fn blend_layer_carries_the_opacity_of_the_layer() {
+        let layer = with(
+            with(shape_layer(1, json!(two_fills())), json!({ "bm": 2 })),
+            opacity(50.0),
+        );
+        assert_eq!(
+            trace(&composition(json!([layer])), 0.0),
+            [
+                "layer(1)",
+                "layer(0.5, Screen)",
+                "fill(1)",
+                "fill(1)",
+                "pop",
+                "pop"
+            ]
+        );
+    }
+
+    #[test]
+    fn blend_layer_holds_the_track_matte() {
+        let source = with(
+            shape_layer(1, json!([rect(0.0, 0.0, 50.0, 50.0), fill(100.0)])),
+            json!({ "td": 1 }),
+        );
+        let matted = with(blended_layer(2, 1), json!({ "tt": 1 }));
+        assert_eq!(
+            trace(&composition(json!([source, matted])), 0.0),
+            [
+                "layer(1)",
+                "layer(1, Multiply)",
+                "fill(1)",
+                "layer(1, SrcIn)",
+                "fill(1)",
+                "pop",
+                "pop",
+                "pop"
+            ]
+        );
+    }
+
+    #[test]
+    fn precomposition_isolates_layers_with_blend_modes() {
+        let assets = json!([precomp("comp", json!([blended_layer(1, 1)]))]);
+        // The layer blends with the content of the precomposition only.
+        let opaque = composition_with_assets(assets.clone(), json!([precomp_layer(1, "comp")]));
+        assert_eq!(
+            trace(&opaque, 0.0),
+            [
+                "clip",
+                "layer(1)",
+                "layer(1, Multiply)",
+                "fill(1)",
+                "pop",
+                "pop",
+                "pop"
+            ]
+        );
+        // The opacity of the precomposition is not handed to a layer that blends.
+        let translucent = composition_with_assets(
+            assets,
+            json!([with(precomp_layer(1, "comp"), opacity(50.0))]),
+        );
+        assert_eq!(
+            trace(&translucent, 0.0),
+            [
+                "clip",
+                "layer(0.5)",
+                "layer(1, Multiply)",
+                "fill(1)",
+                "pop",
+                "pop",
+                "pop"
+            ]
+        );
+    }
+
+    #[test]
+    fn caller_alpha_is_not_handed_to_a_layer_with_a_blend_mode() {
+        let composition = composition(json!([blended_layer(1, 1)]));
+        assert_eq!(
+            trace_with_alpha(&composition, 0.0, 0.5),
+            ["layer(0.5)", "layer(1, Multiply)", "fill(1)", "pop", "pop"]
+        );
+    }
+
+    #[test]
+    fn blend_mode_of_a_layer_that_does_not_draw_is_ignored() {
+        // Transparent, hidden and null layers do not draw.
+        let composition = composition(json!([
+            with(blended_layer(1, 1), opacity(0.0)),
+            with(blended_layer(2, 1), json!({ "hd": true })),
+            with(layer(3, 3), json!({ "bm": 1 })),
+        ]));
+        assert_eq!(trace(&composition, 0.0), ["clip", "pop"]);
+    }
+
+    #[test]
+    fn blend_mode_of_a_layer_without_draw_calls_pushes_no_layer() {
+        // A fill without a path, and a fill that is transparent.
+        let no_path = with(shape_layer(1, json!([fill(100.0)])), json!({ "bm": 1 }));
+        let transparent = with(
+            shape_layer(2, json!([rect(0.0, 0.0, 20.0, 20.0), fill(0.0)])),
+            json!({ "bm": 1 }),
+        );
+        let empty = composition(json!([no_path.clone(), transparent.clone()]));
+        // Neither a blend layer nor a layer to isolate the animation is pushed.
+        assert_eq!(trace(&empty, 0.0), ["clip", "pop"]);
+
+        // A precomposition whose layers make no draw call does not blend either.
+        let assets = json!([precomp("comp", json!([no_path, transparent]))]);
+        let precomposed = composition_with_assets(
+            assets,
+            json!([with(precomp_layer(1, "comp"), json!({ "bm": 1 }))]),
+        );
+        assert_eq!(trace(&precomposed, 0.0), ["clip", "pop"]);
+
+        // With a track matte the layer that holds the matte remains, without the blend mode.
+        let source = with(
+            shape_layer(1, json!([rect(0.0, 0.0, 50.0, 50.0), fill(100.0)])),
+            json!({ "td": 1 }),
+        );
+        let matted = with(
+            shape_layer(2, json!([fill(100.0)])),
+            json!({ "bm": 1, "tt": 1 }),
+        );
+        assert_eq!(
+            trace(&composition(json!([source, matted])), 0.0),
+            [
+                "clip",
+                "layer(1)",
+                "fill(1)",
+                "layer(1, SrcIn)",
+                "pop",
+                "pop",
+                "pop"
+            ]
+        );
+    }
+
+    #[test]
+    fn matte_source_and_matted_layer_keep_their_own_shapes() {
+        // Both layers have several draw calls, and the matted layer is evaluated before its
+        // source is rendered.
+        let source = with(
+            shape_layer(
+                1,
+                json!([
+                    rect(0.0, 0.0, 50.0, 50.0),
+                    fill(100.0),
+                    rect(50.0, 50.0, 60.0, 60.0),
+                    stroke(100.0),
+                ]),
+            ),
+            json!({ "td": 1 }),
+        );
+        let matted = with(blended_layer(2, 1), json!({ "tt": 1 }));
+        let events = render(&composition(json!([source, matted])), 0.0, 1.0);
+        let draws: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Draw {
+                    stroked, bounds, ..
+                } => Some((*stroked, *bounds)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            draws,
+            [
+                (true, Rect::new(0.0, 0.0, 60.0, 60.0)),
+                (false, Rect::new(0.0, 0.0, 50.0, 50.0)),
+                (false, Rect::new(0.0, 0.0, 20.0, 20.0)),
+            ]
+        );
     }
 }

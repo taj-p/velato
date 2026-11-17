@@ -26,6 +26,7 @@ This release has an [MSRV][] of 1.88.
 - Added sequential trimming across repeater copies without changing paint order. ([#128][] by [@RobertBrewitz][])
 - Added `EvaluatedLayer::evaluated_paths()` to query shape paths after transforms, trims, and repeaters without rendering. ([#129][] by [@RobertBrewitz][])
 - Added `Renderer::append_evaluated()` to render saved evaluations without repeating layer evaluation. ([#130][] by [@RobertBrewitz][])
+- Layer blend modes (`bm`) are now rendered: a layer with a blend mode is composited with `RenderSink::push_layer`, and blends only with the animation or precomposition that contains it. `Add` maps to `Compose::PlusLighter`; `HardMix` has no equivalent and renders as normal.
 
 ### Changed
 

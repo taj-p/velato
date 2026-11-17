@@ -24,7 +24,7 @@ use crate::schema::helpers::transform::{AnyTransformP, AnyTransformR};
 use crate::schema::{helpers::int_boolean::BoolInt, layers::AnyLayer};
 use crate::{Composition, schema};
 use kurbo::{Cap, Join, Point, Size, Vec2};
-use peniko::{BlendMode, Color, Mix};
+use peniko::{BlendMode, Color, Compose, Mix};
 use std::collections::HashMap;
 
 fn process_layers(source_layers: &[AnyLayer], idmap: &mut HashMap<usize, usize>) -> Vec<Layer> {
@@ -929,8 +929,9 @@ pub fn conv_blend_mode(
         Saturation => BlendMode::from(Mix::Saturation),
         Color => BlendMode::from(Mix::Color),
         Luminosity => BlendMode::from(Mix::Luminosity),
-        // Not yet mapped to a blend mode; the layer blends normally.
-        Add | HardMix => return None,
+        Add => BlendMode::from(Compose::PlusLighter),
+        // There is no equivalent mode; the layer blends normally.
+        HardMix => return None,
     })
 }
 
@@ -1626,11 +1627,34 @@ mod tests {
     }
 
     #[test]
-    fn add_and_hard_mix_blend_modes_import_as_normal() {
+    fn layer_blend_modes_map_to_mix_and_compose_modes() {
         use crate::test_support::*;
-        for mode in [16, 17] {
+        use peniko::{BlendMode, Compose, Mix};
+        let mixes = [
+            Mix::Multiply,
+            Mix::Screen,
+            Mix::Overlay,
+            Mix::Darken,
+            Mix::Lighten,
+            Mix::ColorDodge,
+            Mix::ColorBurn,
+            Mix::HardLight,
+            Mix::SoftLight,
+            Mix::Difference,
+            Mix::Exclusion,
+            Mix::Hue,
+            Mix::Saturation,
+            Mix::Color,
+            Mix::Luminosity,
+        ];
+        let mut expected: Vec<Option<BlendMode>> = vec![None];
+        expected.extend(mixes.map(|mix| Some(mix.into())));
+        // `Add` sums the colors. `HardMix` has no equivalent and blends normally.
+        expected.push(Some(Compose::PlusLighter.into()));
+        expected.push(None);
+        for (mode, expected) in expected.into_iter().enumerate() {
             let composition = composition(json!([with(layer(3, 1), json!({ "bm": mode }))]));
-            assert_eq!(composition.layers[0].blend_mode, None);
+            assert_eq!(composition.layers[0].blend_mode, expected, "bm {mode}");
         }
     }
 
