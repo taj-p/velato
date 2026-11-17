@@ -38,6 +38,7 @@ This release has an [MSRV][] of 1.88.
 - `RenderSink::draw` takes a new `fill_rule` argument after `stroke`, and `model::Draw` has a new `fill_rule` field. Sinks should fill with that rule when `stroke` is `None`.
 - Layers of an unsupported type, such as text, and layers without a type no longer fail the import. They are imported as empty layers that keep their index, parent, transform and matte settings, and are listed in `Composition::unsupported_layers`. Sound and data source assets no longer fail the import either and are listed in `Composition::unsupported_assets`.
 - The schema enums `AnyLayer` and `AnyAsset` have a new `Unknown` variant that holds such a layer or asset as raw JSON.
+- The transform schema, `schema::helpers::transform::Transform`, has four new public fields for the rotation keys of 3D layers: `x_rotation` (`rx`), `y_rotation` (`ry`), `z_rotation` (`rz`) and `orientation` (`or`). Code that builds the struct literally has to set them.
 - Layers with zero opacity are skipped, along with their `begin_layer_group` and `end_layer_group` calls, and rendering with an `alpha` of zero emits nothing.
 - When the `alpha` passed to the renderer needs compositing, the composition clip is pushed with `RenderSink::push_layer` instead of `push_clip_layer`.
 
