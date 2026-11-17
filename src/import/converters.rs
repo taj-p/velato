@@ -12,6 +12,7 @@ use crate::runtime::model::{
     SpatialKeyframe, SpatialPosition, SplineToPath, Time, Tween, Value,
 };
 use crate::runtime::{self};
+use crate::schema::animated_properties::keyframe::Keyframe;
 use crate::schema::animated_properties::keyframe_bezier_handle::{
     KeyframeBezierHandle, KeyframeComponent,
 };
@@ -352,10 +353,35 @@ pub fn conv_shape_transform(value: &schema::shapes::transform::TransformShape) -
     }
 }
 
+/// Returns the start value of each keyframe.
+///
+/// A keyframe without a start value takes the previous keyframe's end value, or its start value
+/// when that has no end value either. Older exporters end every property with such a keyframe.
+fn keyframe_values<'a>(keyframes: impl Iterator<Item = &'a Keyframe>) -> Vec<&'a [f64]> {
+    let mut values: Vec<&[f64]> = vec![];
+    let mut previous: Option<&Keyframe> = None;
+    for keyframe in keyframes {
+        let value = if keyframe.value.is_empty() {
+            previous
+                .and_then(|previous| previous.end_value_deprecated.as_deref())
+                .filter(|end| !end.is_empty())
+                .or(values.last().copied())
+                .unwrap_or_default()
+        } else {
+            keyframe.value.as_slice()
+        };
+        values.push(value);
+        previous = Some(keyframe);
+    }
+    values
+}
+
 pub fn conv_keyframes<'a, T: Tween>(
-    keyframes: impl Iterator<Item = &'a schema::animated_properties::keyframe::Keyframe>,
-    f: impl Fn(&schema::animated_properties::keyframe::Keyframe) -> T,
+    keyframes: impl Iterator<Item = &'a Keyframe>,
+    f: impl Fn(&[f64]) -> T,
 ) -> Value<T> {
+    let keyframes: Vec<_> = keyframes.collect();
+    let start_values = keyframe_values(keyframes.iter().copied());
     let mut frames = vec![];
     let mut values = vec![];
 
@@ -385,7 +411,7 @@ pub fn conv_keyframes<'a, T: Tween>(
         handles
     };
 
-    for keyframe in keyframes {
+    for (keyframe, start_value) in keyframes.into_iter().zip(start_values) {
         let hold = keyframe
             .base
             .hold
@@ -402,7 +428,7 @@ pub fn conv_keyframes<'a, T: Tween>(
                 out_tangent: None,
                 hold,
             });
-            values.push(f(keyframe));
+            values.push(f(start_value));
         } else {
             for (in_tangent, out_tangent) in tangents {
                 frames.push(Time {
@@ -411,7 +437,7 @@ pub fn conv_keyframes<'a, T: Tween>(
                     out_tangent: Some(out_tangent),
                     hold,
                 });
-                values.push(f(keyframe));
+                values.push(f(start_value));
             }
         }
     }
@@ -472,7 +498,7 @@ fn conv_gradient_colors(
         AnimatedValue(animated) => {
             let mut frames = vec![];
             let mut values: Vec<Vec<f64>> = vec![];
-            for value in animated {
+            for (value, start_value) in animated.iter().zip(keyframe_values(animated.iter())) {
                 let hold = value
                     .base
                     .hold
@@ -486,7 +512,7 @@ fn conv_gradient_colors(
                     hold,
                 });
 
-                let stops = conv_stops(&value.value, count)
+                let stops = conv_stops(start_value, count)
                     .into_iter()
                     .flatten()
                     .collect::<Vec<_>>();
@@ -929,9 +955,9 @@ pub fn conv_scalar(float_value: &schema::animated_properties::value::FloatValue)
         AnimatedValue(keyframes) => {
             let mut frames = vec![];
             let mut values = vec![];
-            for keyframe in keyframes {
+            for (keyframe, start_value) in keyframes.iter().zip(keyframe_values(keyframes.iter())) {
                 let start_time = keyframe.base.time;
-                let data = keyframe.value[0];
+                let data = start_value.first().copied().unwrap_or_default();
                 let hold = keyframe
                     .base
                     .hold
@@ -945,8 +971,6 @@ pub fn conv_scalar(float_value: &schema::animated_properties::value::FloatValue)
                     hold,
                 });
                 values.push(data);
-                // todo: end_value deprecated but should we still push it if it
-                // exists?
             }
             Value::Animated(model::Animated {
                 times: frames,
@@ -958,25 +982,25 @@ pub fn conv_scalar(float_value: &schema::animated_properties::value::FloatValue)
 
 pub fn conv_multi<T: Tween>(
     multidimensional: &schema::animated_properties::multi_dimensional::MultiDimensional,
-    f: impl Fn(&Vec<f64>) -> T,
+    f: impl Fn(&[f64]) -> T,
 ) -> Value<T> {
     use crate::schema::animated_properties::animated_property::AnimatedPropertyK::*;
 
     match &multidimensional.animated_property.value {
         Static(components) => Value::Fixed(f(components)),
-        AnimatedValue(keyframes) => conv_keyframes(keyframes.iter(), |k| f(&k.value)),
+        AnimatedValue(keyframes) => conv_keyframes(keyframes.iter(), &f),
     }
 }
 
 pub fn conv_multi_color<T: Tween>(
     color: &schema::animated_properties::color_value::ColorValue,
-    f: impl Fn(&Vec<f64>) -> T,
+    f: impl Fn(&[f64]) -> T,
 ) -> Value<T> {
     use crate::schema::animated_properties::animated_property::AnimatedPropertyK::*;
 
     match &color.animated_property.value {
         Static(components) => Value::Fixed(f(components)),
-        AnimatedValue(keyframes) => conv_keyframes(keyframes.iter(), |k| f(&k.value)),
+        AnimatedValue(keyframes) => conv_keyframes(keyframes.iter(), &f),
     }
 }
 
@@ -1011,9 +1035,11 @@ pub fn conv_pos_point(value: &schema::animated_properties::position::Position) -
                 keyframe.value_in_tangent.is_some() || keyframe.value_out_tangent.is_some()
             }) =>
         {
+            let start_values = keyframe_values(keyframes.iter().map(|keyframe| &keyframe.keyframe));
             let spatial_keyframes = keyframes
                 .iter()
-                .map(|keyframe| {
+                .zip(start_values)
+                .map(|(keyframe, start_value)| {
                     let base = &keyframe.keyframe.base;
                     SpatialKeyframe {
                         time: Time {
@@ -1022,7 +1048,7 @@ pub fn conv_pos_point(value: &schema::animated_properties::position::Position) -
                             out_tangent: base.out_tangent.as_ref().and_then(temporal_handle),
                             hold: base.hold == Some(BoolInt::True),
                         },
-                        value: point(&keyframe.keyframe.value),
+                        value: point(start_value),
                         out_tangent: keyframe
                             .value_out_tangent
                             .as_ref()
@@ -1038,7 +1064,7 @@ pub fn conv_pos_point(value: &schema::animated_properties::position::Position) -
         }
         Animated(keyframes) => Position::Value(conv_keyframes(
             keyframes.iter().map(|keyframe| &keyframe.keyframe),
-            |keyframe| point(&keyframe.value),
+            point,
         )),
     }
 }
@@ -1163,6 +1189,8 @@ mod tests {
         },
     };
     use kurbo::{Point, Vec2};
+    use peniko::Color;
+    use serde_json::json;
 
     #[expect(deprecated, reason = "Uses deprecated VisualLayer fields")]
     fn make_shape_layer(hidden: bool, matte_target: bool) -> AnyLayer {
@@ -1330,5 +1358,158 @@ mod tests {
         assert_eq!(repeater.position, Point::new(12.0, 34.0));
         assert_eq!(repeater.scale, Vec2::new(100.0, 100.0));
         assert_eq!(repeater.composite, RepeaterComposite::Above);
+    }
+
+    /// Keyframes as written by older exporters: each holds its end value in `e`, and the last
+    /// holds only a time. The easing handles describe a straight line.
+    fn legacy_keyframes(start: serde_json::Value, end: serde_json::Value) -> serde_json::Value {
+        json!([
+            { "t": 0, "s": start, "e": end, "i": { "x": [1], "y": [1] }, "o": { "x": [0], "y": [0] } },
+            { "t": 10 },
+        ])
+    }
+
+    /// Easing is solved numerically, so values between keyframes are not exact.
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-6
+    }
+
+    fn parse<T: serde::de::DeserializeOwned>(value: serde_json::Value) -> T {
+        serde_json::from_value(value).expect("the property should parse")
+    }
+
+    #[test]
+    fn scalar_keyframe_without_start_takes_previous_end() {
+        let value = super::conv_scalar(&parse(
+            json!({ "a": 1, "k": legacy_keyframes(json!([20]), json!([80])) }),
+        ));
+        assert_eq!(value.evaluate(0.0), 20.0);
+        assert!(close(value.evaluate(5.0), 50.0));
+        assert_eq!(value.evaluate(10.0), 80.0);
+        assert_eq!(value.evaluate(15.0), 80.0);
+    }
+
+    #[test]
+    fn multi_dimensional_keyframe_without_start_takes_previous_end() {
+        let value = super::conv_vec2(&parse(json!({
+            "a": 1,
+            "k": legacy_keyframes(json!([0, 100, 100]), json!([50, 200, 100])),
+        })));
+        assert_eq!(value.evaluate(0.0), Vec2::new(0.0, 100.0));
+        let middle = value.evaluate(5.0);
+        assert!(
+            close(middle.x, 25.0) && close(middle.y, 150.0),
+            "{middle:?}"
+        );
+        assert_eq!(value.evaluate(10.0), Vec2::new(50.0, 200.0));
+    }
+
+    #[test]
+    fn position_keyframe_without_start_takes_previous_end() {
+        let position = super::conv_pos_point(&parse(json!({
+            "a": 1,
+            "k": legacy_keyframes(json!([0, 0, 0]), json!([10, 20, 0])),
+        })));
+        assert!(matches!(position, super::Position::Value(_)));
+        assert_eq!(position.evaluate(0.0), Point::new(0.0, 0.0));
+        let middle = position.evaluate(5.0);
+        assert!(close(middle.x, 5.0) && close(middle.y, 10.0), "{middle:?}");
+        assert_eq!(position.evaluate(10.0), Point::new(10.0, 20.0));
+    }
+
+    #[test]
+    fn spatial_position_keyframe_without_start_takes_previous_end() {
+        let mut keyframes = legacy_keyframes(json!([0, 0, 0]), json!([10, 0, 0]));
+        keyframes[0]["to"] = json!([0, 10, 0]);
+        keyframes[0]["ti"] = json!([0, 10, 0]);
+        let position = super::conv_pos_point(&parse(json!({ "a": 1, "k": keyframes })));
+        assert!(matches!(position, super::Position::Spatial(_)));
+        assert_eq!(position.evaluate(0.0), Point::new(0.0, 0.0));
+        // The motion path bulges away from the straight line between the two values.
+        let middle = position.evaluate(5.0);
+        assert!(close(middle.x, 5.0) && middle.y > 5.0, "{middle:?}");
+        assert_eq!(position.evaluate(10.0), Point::new(10.0, 0.0));
+        assert_eq!(position.evaluate(15.0), Point::new(10.0, 0.0));
+    }
+
+    #[test]
+    fn color_keyframe_without_start_takes_previous_end() {
+        let color = super::conv_color(&parse(json!({
+            "a": 1,
+            "k": legacy_keyframes(json!([1, 0, 0, 1]), json!([0, 0, 1, 1])),
+        })));
+        let at = |frame| color.evaluate_or(frame, Color::TRANSPARENT).components;
+        assert_eq!(at(0.0), [1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(at(5.0), [0.5, 0.0, 0.5, 1.0]);
+        assert_eq!(at(10.0), [0.0, 0.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn gradient_keyframe_without_start_takes_previous_end() {
+        let stops = super::conv_gradient_colors(&parse(json!({
+            "p": 2,
+            "k": {
+                "a": 1,
+                "k": legacy_keyframes(
+                    json!([0, 1, 0, 0, 1, 0, 0, 0]),
+                    json!([0, 0, 0, 1, 1, 1, 1, 1]),
+                ),
+            },
+        })));
+        let colors = |frame| -> Vec<[f32; 4]> {
+            stops
+                .evaluate(frame)
+                .as_ref()
+                .iter()
+                .map(|stop| stop.color.components)
+                .collect()
+        };
+        assert_eq!(colors(0.0), [[1.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0, 1.0]]);
+        assert_eq!(colors(5.0), [[0.5, 0.0, 0.5, 1.0], [0.5, 0.5, 0.5, 1.0]]);
+        assert_eq!(colors(10.0), [[0.0, 0.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0]]);
+    }
+
+    #[test]
+    fn keyframe_start_wins_over_previous_end() {
+        let value = super::conv_scalar(&parse(json!({
+            "a": 1,
+            "k": [
+                { "t": 0, "s": [0], "e": [50], "i": { "x": [1], "y": [1] }, "o": { "x": [0], "y": [0] } },
+                { "t": 10, "s": [80] },
+            ],
+        })));
+        assert!(close(value.evaluate(5.0), 40.0));
+        assert_eq!(value.evaluate(10.0), 80.0);
+    }
+
+    #[test]
+    fn keyframe_without_start_or_previous_end_repeats_previous_start() {
+        let value = super::conv_scalar(&parse(json!({
+            "a": 1,
+            "k": [{ "t": 0, "s": [30], "h": 1 }, { "t": 10 }],
+        })));
+        assert_eq!(value.evaluate(5.0), 30.0);
+        assert_eq!(value.evaluate(10.0), 30.0);
+    }
+
+    #[test]
+    fn document_with_legacy_keyframes_imports_and_renders() {
+        use crate::test_support::*;
+        let mut layer = shape_layer(1, json!([rect(0.0, 0.0, 10.0, 10.0), fill(100.0)]));
+        layer["ks"]["o"] = json!({ "a": 1, "k": legacy_keyframes(json!([100]), json!([50])) });
+        layer["ks"]["p"] =
+            json!({ "a": 1, "k": legacy_keyframes(json!([0, 0, 0]), json!([40, 0, 0])) });
+        let composition = composition(json!([layer]));
+        let bounds = |frame| {
+            render(&composition, frame, 1.0)
+                .into_iter()
+                .find_map(|event| match event {
+                    Event::Draw { bounds, .. } => Some(bounds),
+                    _ => None,
+                })
+        };
+        assert_eq!(bounds(0.0), Some(kurbo::Rect::new(0.0, 0.0, 10.0, 10.0)));
+        assert_eq!(bounds(10.0), Some(kurbo::Rect::new(40.0, 0.0, 50.0, 10.0)));
+        assert_eq!(trace(&composition, 10.0), ["clip", "fill(0.5)", "pop"]);
     }
 }

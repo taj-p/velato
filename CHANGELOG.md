@@ -41,6 +41,7 @@ This release has an [MSRV][] of 1.88.
 - Fixed reversed transform skew direction for nonzero `sk` values. ([#119][] by [@RobertBrewitz])
 - Reject invalid animation frame rates duriing import ([#121][] by [@RobertBrewitz][])
 - Fixed omitted layer rotation causing panick during import. ([#122][] by [@RobertBrewitz][])
+- Keyframes without a start value (`s`) now import. Older exporters end each animated property with a keyframe that holds only a time; it takes the previous keyframe's end value (`e`).
 
 ## [0.12.0][] (2026-09-09)
 
