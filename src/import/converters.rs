@@ -297,10 +297,15 @@ fn is_layer_hidden(source: &AnyLayer) -> bool {
 
 /// Returns the rotation in the plane of the composition.
 ///
-/// A split rotation also turns the layer about the X and Y axes, which a 2D transform cannot
-/// express, so only its Z component is used.
-fn transform_rotation(rotation: &Option<AnyTransformR>) -> &FloatValue {
-    match rotation {
+/// A 3D layer has `rx`, `ry`, `rz` and `or` in place of `r`. Its rotations about the X and Y
+/// axes and its orientation cannot be expressed by a 2D transform, so only `rz` is used.
+/// As in lottie-web, `rx` decides which form applies: with it `r` is not read, and without it
+/// `rz` is not.
+fn transform_rotation(transform: &schema::helpers::transform::Transform) -> &FloatValue {
+    if transform.x_rotation.is_some() {
+        return transform.z_rotation.as_ref().unwrap_or(&FLOAT_VALUE_ZERO);
+    }
+    match &transform.rotation {
         Some(AnyTransformR::Rotation(value)) => value,
         Some(AnyTransformR::SplitRotation { z_rotation, .. }) => z_rotation,
         None => &FLOAT_VALUE_ZERO,
@@ -323,7 +328,7 @@ pub fn conv_transform(
         anchor: conv_pos_point(value.anchor_point.as_ref().unwrap_or(&POSITION_ZERO)),
         position: conv_transform_position(&value.position),
         scale: conv_vec2(value.scale.as_ref().unwrap_or(&MULTIDIM_ONE_HUNDRED)),
-        rotation: conv_scalar(transform_rotation(&value.rotation)),
+        rotation: conv_scalar(transform_rotation(value)),
         skew: conv_scalar(value.skew.as_ref().unwrap_or(&FLOAT_VALUE_ZERO)),
         skew_angle: conv_scalar(value.skew_axis.as_ref().unwrap_or(&FLOAT_VALUE_ZERO)),
     };
@@ -348,7 +353,7 @@ pub fn conv_shape_transform(value: &schema::shapes::transform::TransformShape) -
                 .as_ref()
                 .unwrap_or(&MULTIDIM_ONE_HUNDRED),
         ),
-        rotation: conv_scalar(transform_rotation(&value.transform.rotation)),
+        rotation: conv_scalar(transform_rotation(&value.transform)),
         skew: conv_scalar(value.transform.skew.as_ref().unwrap_or(&FLOAT_VALUE_ZERO)),
         skew_angle: conv_scalar(
             value
@@ -755,7 +760,7 @@ fn conv_visible_shape(value: &schema::shapes::AnyShape) -> Option<crate::runtime
                     transform.anchor_point.as_ref().unwrap_or(&POSITION_ZERO),
                 ),
                 position: conv_transform_position(&transform.position),
-                rotation: conv_scalar(transform_rotation(&transform.rotation)),
+                rotation: conv_scalar(transform_rotation(transform)),
                 scale: conv_vec2(transform.scale.as_ref().unwrap_or(&MULTIDIM_ONE_HUNDRED)),
                 start_opacity: conv_scalar(
                     value
@@ -1279,6 +1284,10 @@ mod tests {
                             value: AnimatedPropertyK::Static(0.0),
                         },
                     })),
+                    x_rotation: None,
+                    y_rotation: None,
+                    z_rotation: None,
+                    orientation: None,
                     opacity: None,
                     skew: None,
                     skew_axis: None,
@@ -1945,5 +1954,115 @@ mod tests {
             let composition = composition(json!([solid_layer(1, width, height, "#ff8000")]));
             assert_eq!(trace(&composition, 0.0), ["clip", "pop"]);
         }
+    }
+
+    /// A layer transform with the rotation keys of a 3D layer.
+    fn rotation_3d(x: f64, y: f64, z: serde_json::Value) -> serde_json::Value {
+        use crate::test_support::*;
+        let mut ks = with(
+            transform(100.0),
+            json!({
+                "rx": { "a": 0, "k": x },
+                "ry": { "a": 0, "k": y },
+                "rz": z,
+                "or": { "a": 0, "k": [0, 0, 0] },
+            }),
+        );
+        ks.as_object_mut().unwrap().remove("r");
+        ks
+    }
+
+    #[test]
+    fn layer_with_3d_rotation_keys_rotates_about_the_z_axis() {
+        use crate::test_support::*;
+        let ks = rotation_3d(0.0, 0.0, json!({ "a": 0, "k": 90 }));
+        let layer = with(
+            shape_layer(1, json!([rect(10.0, 0.0, 30.0, 10.0), fill(100.0)])),
+            json!({ "ddd": 1, "ks": ks }),
+        );
+        let composition = composition(json!([layer]));
+        let components = composition.layers[0].transform.components(0.0).unwrap();
+        assert_eq!(components.rotation, 90.0);
+        // A quarter turn clockwise, as for `r`: the rectangle now hangs below the origin.
+        let events = render(&composition, 0.0, 1.0);
+        let Event::Draw { bounds, .. } = &events[2] else {
+            panic!("expected a draw call, got {events:?}");
+        };
+        let expected = kurbo::Rect::new(-10.0, 10.0, 0.0, 30.0);
+        assert!(
+            (bounds.x0 - expected.x0).abs() < 1e-9
+                && (bounds.y0 - expected.y0).abs() < 1e-9
+                && (bounds.x1 - expected.x1).abs() < 1e-9
+                && (bounds.y1 - expected.y1).abs() < 1e-9,
+            "{bounds:?}"
+        );
+    }
+
+    #[test]
+    fn z_rotation_of_a_3d_layer_can_be_animated() {
+        use crate::test_support::*;
+        let keyframes = json!({ "a": 1, "k": legacy_keyframes(json!([0]), json!([90])) });
+        let composition = composition(json!([with(
+            layer(3, 1),
+            json!({ "ks": rotation_3d(0.0, 0.0, keyframes) })
+        )]));
+        let rotation = |frame| {
+            composition.layers[0]
+                .transform
+                .components(frame)
+                .unwrap()
+                .rotation
+        };
+        assert_eq!(rotation(0.0), 0.0);
+        assert!(close(rotation(5.0), 45.0));
+        assert_eq!(rotation(10.0), 90.0);
+    }
+
+    #[test]
+    fn presence_of_x_rotation_decides_between_the_rotation_forms() {
+        use crate::test_support::*;
+        let rotation = |ks: serde_json::Value| {
+            let composition = composition(json!([with(layer(3, 1), json!({ "ks": ks }))]));
+            composition.layers[0]
+                .transform
+                .components(0.0)
+                .unwrap()
+                .rotation
+        };
+        // With `rx`, `r` is not read.
+        let both = with(
+            rotation_3d(0.0, 0.0, json!({ "a": 0, "k": 90 })),
+            json!({ "r": { "a": 0, "k": 30 } }),
+        );
+        assert_eq!(rotation(both), 90.0);
+        // Without `rx`, `rz` is not read.
+        let z_only = with(transform(100.0), json!({ "rz": { "a": 0, "k": 90 } }));
+        assert_eq!(rotation(z_only), 0.0);
+        let mut plain = transform(100.0);
+        plain["r"]["k"] = json!(30);
+        assert_eq!(
+            rotation(with(plain, json!({ "rz": { "a": 0, "k": 90 } }))),
+            30.0
+        );
+        // The rotations about the other axes do not change the rotation in the plane.
+        assert_eq!(
+            rotation(rotation_3d(60.0, 45.0, json!({ "a": 0, "k": 90 }))),
+            90.0
+        );
+    }
+
+    #[test]
+    fn rotation_keys_of_a_3d_layer_round_trip() {
+        use crate::schema::helpers::transform::Transform;
+        let source = json!({
+            "p": { "a": 0, "k": [1.0, 2.0] },
+            "rx": { "a": 0, "k": 10.0 },
+            "ry": { "a": 0, "k": 20.0 },
+            "rz": { "a": 0, "k": 30.0 },
+            "or": { "a": 0, "k": [1.0, 2.0, 3.0] },
+        });
+        let transform: Transform = serde_json::from_value(source.clone()).unwrap();
+        assert!(transform.x_rotation.is_some() && transform.orientation.is_some());
+        assert_eq!(serde_json::to_value(&transform).unwrap(), source);
     }
 }

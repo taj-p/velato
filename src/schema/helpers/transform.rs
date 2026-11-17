@@ -28,6 +28,24 @@ pub struct Transform {
     #[serde(rename = "r")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rotation: Option<AnyTransformR>,
+    /// Rotation about the X axis in degrees. A 3D layer has this, `ry`, `rz` and `or` in
+    /// place of `r`.
+    #[serde(rename = "rx")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub x_rotation: Option<FloatValue>,
+    /// Rotation about the Y axis in degrees, for a 3D layer.
+    #[serde(rename = "ry")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub y_rotation: Option<FloatValue>,
+    /// Rotation about the Z axis in degrees, clockwise, for a 3D layer. This is the rotation
+    /// in the plane of the composition, like `r`.
+    #[serde(rename = "rz")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub z_rotation: Option<FloatValue>,
+    /// Orientation of a 3D layer, as rotations about the X, Y and Z axes in degrees.
+    #[serde(rename = "or")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orientation: Option<MultiDimensional>,
     /// Skew amount as an angle in degrees
     #[serde(rename = "sk")]
     #[serde(skip_serializing_if = "Option::is_none")]
