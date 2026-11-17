@@ -42,6 +42,8 @@ pub enum AnyLayer {
     // unimplemented - Camera(CameraLayer)
     // unimplemented - Light(LightLayer)
     // unimplemented - Data(DataLayer)
+    /// A layer of a type that is not modeled, or without a type, kept as written.
+    Unknown(serde_json::Value),
 }
 
 impl<'de> Deserialize<'de> for AnyLayer {
@@ -53,32 +55,40 @@ impl<'de> Deserialize<'de> for AnyLayer {
 
         let value = serde_json::Value::deserialize(deserializer)?;
 
-        let layer_type = value
-            .get("ty")
-            .and_then(|v| v.as_u64())
-            .ok_or_else(|| D::Error::missing_field("ty"))?;
-
-        match layer_type {
-            0 => serde_json::from_value(value)
+        match AnyLayer::layer_type(&value) {
+            Some(0) => serde_json::from_value(value)
                 .map(AnyLayer::Precomposition)
                 .map_err(D::Error::custom),
-            1 => serde_json::from_value(value)
+            Some(1) => serde_json::from_value(value)
                 .map(AnyLayer::Solid)
                 .map_err(D::Error::custom),
-            2 => serde_json::from_value(value)
+            Some(2) => serde_json::from_value(value)
                 .map(AnyLayer::Image)
                 .map_err(D::Error::custom),
-            3 => serde_json::from_value(value)
+            Some(3) => serde_json::from_value(value)
                 .map(AnyLayer::Null)
                 .map_err(D::Error::custom),
-            4 => serde_json::from_value(value)
+            Some(4) => serde_json::from_value(value)
                 .map(AnyLayer::Shape)
                 .map_err(D::Error::custom),
-            _ => Err(D::Error::custom(format!(
-                "unknown layer type: {}",
-                layer_type
-            ))),
+            _ => Ok(AnyLayer::Unknown(value)),
         }
+    }
+}
+
+impl AnyLayer {
+    /// Returns the type (`ty`) of a layer in its JSON form, if it has one.
+    ///
+    /// A whole number written as a float counts, so that a layer of a modeled type is parsed as
+    /// that type.
+    pub fn layer_type(value: &serde_json::Value) -> Option<u64> {
+        let layer_type = value.get("ty")?;
+        layer_type.as_u64().or_else(|| {
+            layer_type
+                .as_f64()
+                .filter(|number| number.fract() == 0.0 && (0.0..=255.0).contains(number))
+                .map(|number| number as u64)
+        })
     }
 }
 
@@ -337,5 +347,23 @@ mod tests {
     #[test]
     fn test_can_serialize() {
         serde_json::to_value(&*LAYER).unwrap();
+    }
+
+    #[test]
+    fn layer_of_unmodeled_type_is_kept_as_written() {
+        let text = json!({ "ty": 5, "ind": 3, "nm": "Title", "t": { "d": { "k": [] } } });
+        let without_type = json!({ "ind": 4 });
+        for source in [text, without_type] {
+            let layer: AnyLayer = serde_json::from_value(source.clone()).unwrap();
+            assert_eq!(layer, AnyLayer::Unknown(source.clone()));
+            assert_eq!(serde_json::to_value(&layer).unwrap(), source);
+        }
+    }
+
+    #[test]
+    fn layer_of_modeled_type_must_still_parse() {
+        // A shape layer without its required transform.
+        let result = serde_json::from_value::<AnyLayer>(json!({ "ty": 4, "ip": 0, "op": 1 }));
+        assert!(result.is_err());
     }
 }

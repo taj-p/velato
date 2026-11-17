@@ -40,6 +40,15 @@ pub struct Composition {
     pub images: HashMap<String, model::ImageAsset>,
     /// Collection of layers.
     pub layers: Vec<model::Layer>,
+    /// Layers that do not render as authored, in the main composition and in precomposition
+    /// assets.
+    ///
+    /// This lists layers of an unsupported type, which are imported as empty layers, and 3D
+    /// layers that are rotated out of the plane of the composition. Other features that are
+    /// not supported, such as mask modes, are not reported here.
+    pub unsupported_layers: Vec<model::UnsupportedLayer>,
+    /// Assets that were left out because their kind is unsupported.
+    pub unsupported_assets: Vec<model::UnsupportedAsset>,
 }
 
 impl Composition {

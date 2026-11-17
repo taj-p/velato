@@ -36,13 +36,19 @@
 //!
 //! Missing features include:
 //! - Time remapping (`tm`)
-//! - Text
+//! - Text, audio, video and any other layer type that is not modeled (these import as empty
+//!   layers and are listed in [`Composition::unsupported_layers`])
+//! - Sound and data source assets (these are listed in [`Composition::unsupported_assets`])
 //! - Image embedding
+//! - Mask modes other than add, inverted masks and mask opacity (every mask clips to its path)
+//! - Luma track mattes (they are used as alpha mattes)
+//! - Layer styles
 //! - Advanced shapes (stroke dash, zig-zag, etc.)
 //! - Layer effects other than Gaussian blur, drop shadow, fill, and tint
 //! - Correct color stop handling
 //! - 3D layers (of the rotation keys `rx`, `ry`, `rz` and `or`, only the rotation about the Z
-//!   axis, `rz`, is applied; `rx`, `ry` and `or` are ignored)
+//!   axis, `rz`, is applied; `rx`, `ry` and `or` are ignored, and a layer where one of them is
+//!   not zero is listed in [`Composition::unsupported_layers`])
 
 // LINEBENDER LINT SET - lib.rs - v4
 // See https://linebender.org/wiki/canonical-lints/

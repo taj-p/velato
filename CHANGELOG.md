@@ -27,6 +27,7 @@ This release has an [MSRV][] of 1.88.
 - Added `EvaluatedLayer::evaluated_paths()` to query shape paths after transforms, trims, and repeaters without rendering. ([#129][] by [@RobertBrewitz][])
 - Added `Renderer::append_evaluated()` to render saved evaluations without repeating layer evaluation. ([#130][] by [@RobertBrewitz][])
 - Solid color layers (`ty` 1) are now rendered, as a rectangle of the layer's `sw` by `sh` filled with its color `sc`. They were imported without content and drew nothing. The model holds a solid layer as `Content::Shape` with that rectangle and fill.
+- Added `Composition::unsupported_layers`, which lists layers of an unsupported type and 3D layers that are rotated about the X or Y axis or have an orientation, and `Composition::unsupported_assets`, which lists sound and data source assets. Other unsupported features are not reported.
 - Layer blend modes (`bm`) are now rendered: a layer with a blend mode is composited with `RenderSink::push_layer`, and blends only with the animation or precomposition that contains it. `Add` maps to `Compose::PlusLighter`; `HardMix` has no equivalent and renders as normal.
 
 ### Changed
@@ -34,6 +35,8 @@ This release has an [MSRV][] of 1.88.
 - Position keyframes now retain spatial tangents (`ti`, `to`) and follow curved motion paths using temporally eased arc length. ([#120][] by [@RobertBrewitz])
 - Renamed `Layer::mask_layer` to `matte` and `Layer::is_mask` to `is_matte_source` to distinguish track mattes from path masks in accordance with lottie spec layers docs. ([#125][] by [@RobertBrewitz][])
 - Parent and matte references now use `LayerReference`. ([#125][] by [@RobertBrewitz][])
+- Layers of an unsupported type, such as text, and layers without a type no longer fail the import. They are imported as empty layers that keep their index, parent, transform and matte settings, and are listed in `Composition::unsupported_layers`. Sound and data source assets no longer fail the import either and are listed in `Composition::unsupported_assets`.
+- The schema enums `AnyLayer` and `AnyAsset` have a new `Unknown` variant that holds such a layer or asset as raw JSON.
 - Layers with zero opacity are skipped, along with their `begin_layer_group` and `end_layer_group` calls, and rendering with an `alpha` of zero emits nothing.
 - When the `alpha` passed to the renderer needs compositing, the composition clip is pushed with `RenderSink::push_layer` instead of `push_clip_layer`.
 

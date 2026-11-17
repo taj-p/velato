@@ -327,6 +327,48 @@ pub struct UnsupportedEffect {
     pub effect_type: Option<u64>,
 }
 
+/// A layer that does not render as authored, because it uses something Velato does not
+/// support.
+///
+/// See [`Composition::unsupported_layers`](crate::Composition).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnsupportedLayer {
+    /// Identifier of the precomposition asset that holds the layer, or `None` if the layer is
+    /// in the main composition.
+    pub asset: Option<String>,
+    /// Position of the layer in the layer array of its composition.
+    pub index: usize,
+    /// The layer's `nm` field.
+    pub name: String,
+    /// What is not supported.
+    pub feature: UnsupportedLayerFeature,
+}
+
+/// What Velato does not support about an [`UnsupportedLayer`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum UnsupportedLayerFeature {
+    /// The type of the layer, such as text. It holds the layer's `ty` field, or `None` if that
+    /// is missing or not a whole number.
+    ///
+    /// The layer is kept as an empty layer that draws nothing, so that layers parented to it
+    /// still follow its transform.
+    LayerType(Option<u64>),
+    /// Rotation of a 3D layer about the X or Y axis, or its orientation (`rx`, `ry`, `or`).
+    ///
+    /// The layer is drawn without them. Its rotation about the Z axis is applied.
+    Rotation3d,
+}
+
+/// An asset Velato could not import because its kind is unsupported, such as a sound.
+///
+/// See [`Composition::unsupported_assets`](crate::Composition).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnsupportedAsset {
+    /// The asset's `id` field, by which layers refer to it.
+    pub id: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LayerReference {
     /// Runtime index in the containing composition's layer array.

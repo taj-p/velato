@@ -27,14 +27,35 @@ use kurbo::{Cap, Join, Point, Size, Vec2};
 use peniko::{BlendMode, Color, Compose, Mix};
 use std::collections::HashMap;
 
-fn process_layers(source_layers: &[AnyLayer], idmap: &mut HashMap<usize, usize>) -> Vec<Layer> {
+/// Converts the layers of the main composition, or of the precomposition asset `asset`.
+fn process_layers(
+    source_layers: &[AnyLayer],
+    asset: Option<&str>,
+    idmap: &mut HashMap<usize, usize>,
+    unsupported: &mut Vec<model::UnsupportedLayer>,
+) -> Vec<Layer> {
     idmap.clear();
 
     let mut converted: Vec<(Layer, usize, Option<BlendMode>, Option<usize>)> = vec![];
 
-    for layer in source_layers {
-        if let Some((layer, id, matte_mode, matte_layer_index)) = conv_layer(layer) {
+    for source in source_layers {
+        if let Some((layer, id, matte_mode, matte_layer_index)) = conv_layer(source) {
             let index = converted.len();
+            let feature = match source {
+                AnyLayer::Unknown(value) => Some(model::UnsupportedLayerFeature::LayerType(
+                    AnyLayer::layer_type(value),
+                )),
+                _ if has_3d_rotation(source) => Some(model::UnsupportedLayerFeature::Rotation3d),
+                _ => None,
+            };
+            if let Some(feature) = feature {
+                unsupported.push(model::UnsupportedLayer {
+                    asset: asset.map(str::to_owned),
+                    index,
+                    name: layer.name.clone(),
+                    feature,
+                });
+            }
             idmap.insert(id, index);
             converted.push((layer, id, matte_mode, matte_layer_index));
         }
@@ -98,6 +119,8 @@ pub fn conv_animation(source: schema::Animation) -> Result<Composition, crate::E
         assets: Default::default(),
         images: Default::default(),
         layers: Default::default(),
+        unsupported_layers: Default::default(),
+        unsupported_assets: Default::default(),
     };
 
     // Collect assets and layers
@@ -107,8 +130,19 @@ pub fn conv_animation(source: schema::Animation) -> Result<Composition, crate::E
         for asset in assets {
             match asset {
                 schema::assets::AnyAsset::Precomposition(precomp) => {
-                    let layers = process_layers(&precomp.composition.layers, &mut idmap);
+                    let layers = process_layers(
+                        &precomp.composition.layers,
+                        Some(&precomp.asset.id),
+                        &mut idmap,
+                        &mut target.unsupported_layers,
+                    );
                     target.assets.insert(precomp.asset.id.clone(), layers);
+                }
+                schema::assets::AnyAsset::Unknown(value) => {
+                    let id = value.get("id").and_then(serde_json::Value::as_str);
+                    target.unsupported_assets.push(model::UnsupportedAsset {
+                        id: id.unwrap_or_default().to_owned(),
+                    });
                 }
                 schema::assets::AnyAsset::Image(image) => {
                     let file = image.file_asset;
@@ -129,7 +163,12 @@ pub fn conv_animation(source: schema::Animation) -> Result<Composition, crate::E
         }
     }
 
-    target.layers = process_layers(&source.composition.layers, &mut idmap);
+    target.layers = process_layers(
+        &source.composition.layers,
+        None,
+        &mut idmap,
+        &mut target.unsupported_layers,
+    );
 
     Ok(target)
 }
@@ -174,17 +213,22 @@ pub fn conv_layer(source: &AnyLayer) -> Option<(Layer, usize, Option<BlendMode>,
             };
             params
         }
+        AnyLayer::Unknown(value) => setup_unknown_layer(value, &mut layer),
     };
 
     {
         let visual = match source {
-            AnyLayer::Null(l) => &l.visual_layer,
-            AnyLayer::Precomposition(l) => &l.visual_layer,
-            AnyLayer::Shape(l) => &l.visual_layer,
-            AnyLayer::Solid(l) => &l.visual_layer,
-            AnyLayer::Image(l) => &l.visual_layer,
+            AnyLayer::Null(l) => Some(&l.visual_layer),
+            AnyLayer::Precomposition(l) => Some(&l.visual_layer),
+            AnyLayer::Shape(l) => Some(&l.visual_layer),
+            AnyLayer::Solid(l) => Some(&l.visual_layer),
+            AnyLayer::Image(l) => Some(&l.visual_layer),
+            AnyLayer::Unknown(_) => None,
         };
-        for effect in visual.effects.iter().flatten() {
+        for effect in visual
+            .iter()
+            .flat_map(|visual| visual.effects.iter().flatten())
+        {
             if effect.get("en").is_some_and(|enabled| {
                 enabled.as_bool() == Some(false) || enabled.as_u64() == Some(0)
             }) {
@@ -291,8 +335,81 @@ fn is_layer_hidden(source: &AnyLayer) -> bool {
         AnyLayer::Shape(l) => l.visual_layer.layer.hidden,
         AnyLayer::Solid(l) => l.visual_layer.layer.hidden,
         AnyLayer::Image(l) => l.visual_layer.layer.hidden,
+        AnyLayer::Unknown(value) => value.get("hd").and_then(serde_json::Value::as_bool),
     };
     hidden == Some(true)
+}
+
+/// Whether the layer is rotated out of the plane of the composition: about the X or Y axis,
+/// or by its orientation. These are only read from a transform that has `rx`.
+fn has_3d_rotation(source: &AnyLayer) -> bool {
+    use crate::schema::animated_properties::animated_property::AnimatedPropertyK;
+    fn any_keyframe_is_not_zero(keyframes: &[Keyframe]) -> bool {
+        keyframes.iter().any(|keyframe| {
+            let end = keyframe.end_value_deprecated.iter().flatten();
+            keyframe.value.iter().chain(end).any(|value| *value != 0.0)
+        })
+    }
+    fn scalar_is_not_zero(value: &FloatValue) -> bool {
+        match &value.animated_property.value {
+            AnimatedPropertyK::Static(value) => *value != 0.0,
+            AnimatedPropertyK::AnimatedValue(keyframes) => any_keyframe_is_not_zero(keyframes),
+        }
+    }
+    let transform = match source {
+        AnyLayer::Null(layer) => &layer.visual_layer.transform,
+        AnyLayer::Precomposition(layer) => &layer.visual_layer.transform,
+        AnyLayer::Shape(layer) => &layer.visual_layer.transform,
+        AnyLayer::Solid(layer) => &layer.visual_layer.transform,
+        AnyLayer::Image(layer) => &layer.visual_layer.transform,
+        AnyLayer::Unknown(_) => return false,
+    };
+    if transform.x_rotation.is_none() {
+        return false;
+    }
+    let orientation = transform
+        .orientation
+        .as_ref()
+        .is_some_and(|orientation| match &orientation.animated_property.value {
+            AnimatedPropertyK::Static(values) => values.iter().any(|value| *value != 0.0),
+            AnimatedPropertyK::AnimatedValue(keyframes) => any_keyframe_is_not_zero(keyframes),
+        });
+    orientation
+        || [&transform.x_rotation, &transform.y_rotation]
+            .into_iter()
+            .flatten()
+            .any(scalar_is_not_zero)
+}
+
+/// Sets up a layer of an unsupported type as an empty layer.
+///
+/// Other layers may be parented to it or use it as a track matte, so it keeps what all layers
+/// have in common if that parses: its index, parent, transform, timing and matte settings.
+/// Otherwise it keeps its name, index and parent.
+fn setup_unknown_layer(value: &serde_json::Value, layer: &mut Layer) -> LayerSetupParams {
+    let mut null_layer = value.clone();
+    if let Some(fields) = null_layer.as_object_mut() {
+        fields.insert("ty".to_owned(), 3.into());
+    }
+    if let Ok(null_layer) = serde_json::from_value::<schema::layers::null::NullLayer>(null_layer) {
+        let params = setup_layer_base(&null_layer.visual_layer, layer);
+        // The layer has no content for these to apply to.
+        layer.masks.clear();
+        layer.blend_mode = None;
+        return params;
+    }
+    let index = |key| value.get(key).and_then(serde_json::Value::as_u64);
+    layer.name = value
+        .get("nm")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    layer.parent = index("parent").map(|id| model::LayerReference::Unresolved(id as usize));
+    LayerSetupParams {
+        layer_index: index("ind").unwrap_or(0) as usize,
+        matte_mode: None,
+        matte_layer_index: None,
+    }
 }
 
 /// Returns the rotation in the plane of the composition.
@@ -2064,5 +2181,275 @@ mod tests {
         let transform: Transform = serde_json::from_value(source.clone()).unwrap();
         assert!(transform.x_rotation.is_some() && transform.orientation.is_some());
         assert_eq!(serde_json::to_value(&transform).unwrap(), source);
+    }
+
+    /// A text layer, which is not supported. Its text data is abbreviated.
+    fn text_layer(ind: u32) -> serde_json::Value {
+        use crate::test_support::*;
+        with(
+            layer(5, ind),
+            json!({ "nm": "Title", "t": { "d": { "k": [] } } }),
+        )
+    }
+
+    #[test]
+    fn layer_of_unsupported_type_imports_as_an_empty_layer_and_is_listed() {
+        use crate::test_support::*;
+        let composition = composition(json!([
+            shape_layer(1, json!([rect(0.0, 0.0, 10.0, 10.0), fill(100.0)])),
+            text_layer(2),
+        ]));
+        assert_eq!(
+            composition.unsupported_layers,
+            [model::UnsupportedLayer {
+                asset: None,
+                index: 1,
+                name: "Title".into(),
+                feature: model::UnsupportedLayerFeature::LayerType(Some(5)),
+            }]
+        );
+        assert!(composition.unsupported_assets.is_empty());
+        assert!(matches!(composition.layers[1].content, Content::None));
+        // The text draws nothing; the shape layer is unaffected.
+        assert_eq!(trace(&composition, 0.0), ["clip", "fill(1)", "pop"]);
+    }
+
+    #[test]
+    fn unsupported_layer_keeps_its_index_parent_and_transform() {
+        use crate::test_support::*;
+        let position = |x: f64, y: f64| json!({ "ks": with(transform(100.0), json!({ "p": { "a": 0, "k": [x, y] } })) });
+        let composition = composition(json!([
+            with(
+                shape_layer(1, json!([rect(0.0, 0.0, 10.0, 10.0), fill(100.0)])),
+                json!({ "parent": 2 }),
+            ),
+            with(
+                with(text_layer(2), position(10.0, 20.0)),
+                json!({ "parent": 3 })
+            ),
+            with(layer(3, 3), position(100.0, 200.0)),
+        ]));
+        assert_eq!(composition.unsupported_layers.len(), 1);
+        assert_eq!(
+            composition.layers[0].parent,
+            Some(model::LayerReference::Resolved(1))
+        );
+        assert_eq!(
+            composition.layers[1].parent,
+            Some(model::LayerReference::Resolved(2))
+        );
+        // The shape follows the text layer, which follows the null layer.
+        let events = render(&composition, 0.0, 1.0);
+        assert!(events.contains(&Event::Draw {
+            stroked: false,
+            alpha: 1.0,
+            bounds: kurbo::Rect::new(110.0, 220.0, 120.0, 230.0),
+        }));
+    }
+
+    #[test]
+    fn unsupported_layer_in_a_precomposition_names_its_asset() {
+        use crate::test_support::*;
+        let composition = composition_with_assets(
+            json!([precomp("comp", json!([text_layer(1)]))]),
+            json!([precomp_layer(1, "comp")]),
+        );
+        assert_eq!(
+            composition.unsupported_layers,
+            [model::UnsupportedLayer {
+                asset: Some("comp".into()),
+                index: 0,
+                name: "Title".into(),
+                feature: model::UnsupportedLayerFeature::LayerType(Some(5)),
+            }]
+        );
+        assert_eq!(trace(&composition, 0.0), ["clip", "pop"]);
+    }
+
+    #[test]
+    fn unsupported_layer_without_a_transform_keeps_its_name_index_and_parent() {
+        use crate::test_support::*;
+        // An audio layer has no transform, and a layer may lack a type altogether.
+        let audio = json!({
+            "ty": 6,
+            "ind": 7,
+            "parent": 8,
+            "nm": "voice",
+            "refId": "sound",
+            "ip": 0,
+            "op": 60,
+        });
+        let untyped = json!({ "ind": 8, "nm": "untyped" });
+        let composition = composition(json!([
+            audio,
+            untyped,
+            with(layer(3, 2), json!({ "parent": 7 })),
+        ]));
+        let listed: Vec<_> = composition
+            .unsupported_layers
+            .iter()
+            .map(|layer| (layer.index, layer.name.as_str(), layer.feature))
+            .collect();
+        let layer_type = model::UnsupportedLayerFeature::LayerType;
+        assert_eq!(
+            listed,
+            [
+                (0, "voice", layer_type(Some(6))),
+                (1, "untyped", layer_type(None))
+            ]
+        );
+        assert_eq!(
+            composition.layers[0].parent,
+            Some(model::LayerReference::Resolved(1))
+        );
+        assert_eq!(
+            composition.layers[2].parent,
+            Some(model::LayerReference::Resolved(0))
+        );
+        assert_eq!(trace(&composition, 0.0), ["clip", "pop"]);
+    }
+
+    #[test]
+    fn unsupported_layer_keeps_its_track_matte_settings() {
+        use crate::test_support::*;
+        // The text is matted by the shape above it, so the shape is drawn only as its matte.
+        let composition = composition(json!([
+            shape_layer(1, json!([rect(0.0, 0.0, 10.0, 10.0), fill(100.0)])),
+            with(text_layer(2), json!({ "tt": 1 })),
+        ]));
+        assert!(composition.layers[0].is_matte_source);
+        assert_eq!(
+            trace(&composition, 0.0),
+            [
+                "clip",
+                "layer(1)",
+                "fill(1)",
+                "layer(1, SrcIn)",
+                "pop",
+                "pop",
+                "pop"
+            ]
+        );
+    }
+
+    #[test]
+    fn unsupported_layer_draws_nothing_and_clips_nothing() {
+        use crate::test_support::*;
+        let mask = json!({
+            "mode": "a",
+            "o": { "a": 0, "k": 100 },
+            "pt": {
+                "a": 0,
+                "k": {
+                    "c": true,
+                    "v": [[0, 0], [20, 0], [20, 20], [0, 20]],
+                    "i": [[0, 0], [0, 0], [0, 0], [0, 0]],
+                    "o": [[0, 0], [0, 0], [0, 0], [0, 0]],
+                },
+            },
+        });
+        // The mask and the blend mode of a text layer have no content to apply to.
+        let text = with(text_layer(1), json!({ "masksProperties": [mask], "bm": 1 }));
+        let composition = composition(json!([text]));
+        assert!(composition.layers[0].masks.is_empty());
+        assert_eq!(composition.layers[0].blend_mode, None);
+        assert_eq!(trace(&composition, 0.0), ["clip", "pop"]);
+    }
+
+    #[test]
+    fn layer_rotated_out_of_the_plane_is_listed() {
+        use crate::test_support::*;
+        let z = || json!({ "a": 0, "k": 90 });
+        let rotated = |ind: u32, ks: serde_json::Value| {
+            with(
+                shape_layer(ind, json!([rect(0.0, 0.0, 10.0, 10.0), fill(100.0)])),
+                json!({ "ddd": 1, "ks": ks }),
+            )
+        };
+        let animated_x = with(
+            rotation_3d(0.0, 0.0, z()),
+            json!({ "rx": { "a": 1, "k": legacy_keyframes(json!([0]), json!([45])) } }),
+        );
+        let oriented = with(
+            rotation_3d(0.0, 0.0, z()),
+            json!({ "or": { "a": 0, "k": [0, 0, 30] } }),
+        );
+        let composition = composition_with_assets(
+            json!([precomp(
+                "comp",
+                json!([rotated(1, rotation_3d(0.0, 20.0, z()))])
+            )]),
+            json!([
+                // Rotation about the Z axis alone is supported.
+                rotated(1, rotation_3d(0.0, 0.0, z())),
+                rotated(2, rotation_3d(60.0, 0.0, z())),
+                rotated(3, animated_x),
+                rotated(4, oriented),
+                precomp_layer(5, "comp"),
+            ]),
+        );
+        let listed: Vec<_> = composition
+            .unsupported_layers
+            .iter()
+            .map(|layer| (layer.asset.as_deref(), layer.index, layer.feature))
+            .collect();
+        let rotation = model::UnsupportedLayerFeature::Rotation3d;
+        assert_eq!(
+            listed,
+            [
+                (Some("comp"), 0, rotation),
+                (None, 1, rotation),
+                (None, 2, rotation),
+                (None, 3, rotation),
+            ]
+        );
+        // The layers are still drawn, with their rotation about the Z axis.
+        assert_eq!(
+            trace(&composition, 0.0),
+            [
+                "clip", "fill(1)", "fill(1)", "fill(1)", "fill(1)", "fill(1)", "pop"
+            ]
+        );
+    }
+
+    #[test]
+    fn asset_of_unsupported_kind_is_listed() {
+        use crate::test_support::*;
+        let composition = composition_with_assets(
+            json!([
+                { "id": "sound", "u": "sounds/", "p": "voice.mp3", "e": 0 },
+                { "id": "data", "p": "data.json", "t": 3 },
+                { "id": "image", "w": 8, "h": 8, "u": "", "p": "image.png", "e": 0 },
+            ]),
+            json!([shape_layer(
+                1,
+                json!([rect(0.0, 0.0, 10.0, 10.0), fill(100.0)])
+            )]),
+        );
+        let ids: Vec<_> = composition
+            .unsupported_assets
+            .iter()
+            .map(|asset| asset.id.as_str())
+            .collect();
+        assert_eq!(ids, ["sound", "data"]);
+        assert!(composition.images.contains_key("image"));
+        assert!(composition.unsupported_layers.is_empty());
+    }
+
+    #[test]
+    fn layer_type_written_as_a_float_is_not_treated_as_unsupported() {
+        use crate::test_support::*;
+        // The layer is a null layer, so it must not be reported as an unsupported type. Its
+        // other integers are floats too, which the schema of a null layer does not accept.
+        let result = crate::Composition::from_json(json!({
+            "v": "5.7.14",
+            "fr": 60,
+            "ip": 0,
+            "op": 60,
+            "w": 100,
+            "h": 100,
+            "layers": [with(layer(3, 1), json!({ "ty": 3.0 }))],
+        }));
+        assert!(result.is_err());
     }
 }
