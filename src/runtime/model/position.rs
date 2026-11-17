@@ -72,6 +72,33 @@ impl SpatialPosition {
         }
     }
 
+    /// Returns the curve, or a copy of it that starts at the origin if the curve is very short
+    /// for the coordinates that it lies at.
+    ///
+    /// kurbo halves a curve until its halves are accurate enough. The halves of a curve that
+    /// is not much longer than the spacing of floats at its coordinates are rounding errors,
+    /// which never are, so that kurbo halves the curve as far as it can. At the origin the
+    /// points of the copy are as precise as the curve is short.
+    fn resolvable(curve: CubicBez) -> CubicBez {
+        // A curve that is longer than this fraction of its coordinates is accurate enough
+        // well before its halves come near the spacing of floats.
+        const SHORT: f64 = 1.0 / 65536.0;
+        let points = [curve.p0, curve.p1, curve.p2, curve.p3];
+        let largest = |values: [Vec2; 4]| {
+            values.iter().fold(0.0_f64, |largest, value| {
+                largest.max(value.x.abs()).max(value.y.abs())
+            })
+        };
+        let magnitude = largest(points.map(Point::to_vec2));
+        let offsets = points.map(|point| point - curve.p0);
+        if largest(offsets) < magnitude * SHORT {
+            let [p0, p1, p2, p3] = offsets.map(Vec2::to_point);
+            CubicBez::new(p0, p1, p2, p3)
+        } else {
+            curve
+        }
+    }
+
     pub fn new(keyframes: Vec<SpatialKeyframe>) -> Self {
         let paths = keyframes
             .windows(2)
@@ -96,7 +123,7 @@ impl SpatialPosition {
                 // measures it. For a very large curve they overflow, and for a very small one
                 // they underflow, and either keeps it from converging. Such curves are
                 // measured scaled.
-                let (measured, scale) = measurable(PathSeg::Cubic(curve));
+                let (measured, scale) = measurable(PathSeg::Cubic(Self::resolvable(curve)));
                 let control_length = match measured {
                     PathSeg::Cubic(fitted) => {
                         (fitted.p1 - fitted.p0).hypot()
@@ -201,6 +228,34 @@ mod tests {
         // Halfway along the first arc, which bulges away from the X axis.
         assert!((middle.x / size - 0.5).abs() < 1e-6, "{middle:?}");
         assert!(middle.y / size > 0.5, "{middle:?}");
+    }
+
+    #[test]
+    fn motion_path_shorter_than_its_coordinates_resolve_is_measured() {
+        // Keyframes that return to the point they left, by way of tangents that are barely
+        // longer than the spacing of floats at that point. Halved where it lies, such a path
+        // turns into rounding errors, which are never accurate enough for kurbo, so that it
+        // halves the path as far as it can. Each of these took milliseconds to evaluate.
+        let cases = [
+            ((100.0, 250.0), (0.0, 0.0), (1e-12, 0.0)),
+            ((-37.25, 0.001), (1e-13, 0.0), (0.0, 1e-13)),
+            ((512.0, 384.5), (1e-12, 1e-12), (1e-12, -1e-12)),
+            ((512.0, 384.5), (1e-9, 0.0), (0.0, 1e-9)),
+        ];
+        let start = Instant::now();
+        for (point, out_tangent, in_tangent) in cases {
+            let point = Point::from(point);
+            let mut first = keyframe(0.0, point, Vec2::from(out_tangent));
+            first.in_tangent = Some(Vec2::from(in_tangent));
+            let last = keyframe(1000.0, point, Vec2::ZERO);
+            let position = SpatialPosition::new(vec![first, last]);
+            let reach = Vec2::from(out_tangent).hypot() + Vec2::from(in_tangent).hypot();
+            for frame in 1..1000 {
+                let value = position.evaluate(f64::from(frame));
+                assert!((value - point).hypot() <= reach, "{point:?}: {value:?}");
+            }
+        }
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
 
     #[test]
