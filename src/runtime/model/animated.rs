@@ -451,11 +451,20 @@ impl Spline {
     /// Evaluates the spline at the given frame and emits the elements
     /// to the specified path.
     pub fn evaluate(&self, frame: f64, path: &mut Vec<PathEl>) -> bool {
-        let Some(([ix0, ix1], t, _easing, hold)) = Time::frames_and_weight(&self.times, frame)
+        let Some(([ix0, ix1], t, easing, hold)) = Time::frames_and_weight(&self.times, frame)
         else {
             return false;
         };
-        let t = if hold { 0.0 } else { t };
+        // The easing of the keyframe turns the share of the time that has passed into the
+        // share of the way to the next keyframe. Linear easing leaves it as it is, which
+        // solving the easing curve for it would only do approximately.
+        let t = if hold {
+            0.0
+        } else if easing.is_linear() {
+            t
+        } else {
+            0.0.tween(&1.0, t, &easing)
+        };
         let (Some(from), Some(to)) = (self.values.get(ix0), self.values.get(ix1)) else {
             return false;
         };

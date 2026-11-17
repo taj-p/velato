@@ -2164,6 +2164,85 @@ mod tests {
         assert!(bounds.x0 > 1e24 && bounds.x1 < 9e24, "{bounds:?}");
     }
 
+    /// A square path that grows from a side of 20 to a side of 80 between frames 0 and 40,
+    /// with the given easing on its first keyframe.
+    fn growing_square(easing: serde_json::Value) -> serde_json::Value {
+        let square = |side: f64| {
+            json!([{
+                "c": true,
+                "v": [[10, 10], [10.0 + side, 10], [10.0 + side, 10.0 + side], [10, 10.0 + side]],
+                "i": [[0, 0], [0, 0], [0, 0], [0, 0]],
+                "o": [[0, 0], [0, 0], [0, 0], [0, 0]],
+            }])
+        };
+        json!({
+            "a": 1,
+            "k": [
+                with(json!({ "t": 0, "s": square(20.0) }), easing),
+                { "t": 40, "s": square(80.0) },
+            ],
+        })
+    }
+
+    #[test]
+    fn path_keyframes_are_eased() {
+        let side_at = |easing: serde_json::Value, frame: f64| {
+            let shapes = json!([{ "ty": "sh", "ks": growing_square(easing) }, fill(100.0)]);
+            let events = render(&composition(json!([shape_layer(1, shapes)])), frame, 1.0);
+            let [bounds] = draw_bounds(&events)[..] else {
+                panic!("expected one draw call, got {events:?}");
+            };
+            assert_eq!((bounds.x0, bounds.y0), (10.0, 10.0));
+            assert_eq!(bounds.width(), bounds.height());
+            bounds.width()
+        };
+        // An easing curve that starts and ends slowly. A quarter of the time into it, the path
+        // has only gone 3.7 % of the way, where it used to have gone a quarter of it.
+        let slow = json!({ "o": { "x": [0.9], "y": [0] }, "i": { "x": [0.1], "y": [1] } });
+        let side = side_at(slow.clone(), 10.0);
+        assert!((side - 22.2).abs() < 0.05, "{side}");
+        // The curve is symmetric, so halfway through the time is halfway there.
+        assert!((side_at(slow.clone(), 20.0) - 50.0).abs() < 1e-9);
+        assert_eq!(side_at(slow.clone(), 0.0), 20.0);
+        assert_eq!(side_at(slow, 40.0), 80.0);
+        // Easing can leave the range between the keyframes.
+        let overshooting = json!({ "o": { "x": [0.3], "y": [2] }, "i": { "x": [0.7], "y": [2] } });
+        assert!(side_at(overshooting, 20.0) > 80.0);
+        // Linear easing, written out or left out, is exactly linear.
+        let linear =
+            json!({ "o": { "x": [0.167], "y": [0.167] }, "i": { "x": [0.833], "y": [0.833] } });
+        assert_eq!(side_at(linear, 10.0), 35.0);
+        assert_eq!(side_at(json!({}), 10.0), 35.0);
+        // A hold keyframe keeps its path until the next keyframe.
+        let hold = json!({ "h": 1, "o": { "x": [0.9], "y": [0] }, "i": { "x": [0.1], "y": [1] } });
+        assert_eq!(side_at(hold, 39.0), 20.0);
+    }
+
+    #[test]
+    fn mask_path_keyframes_are_eased() {
+        let slow = json!({ "o": { "x": [0.9], "y": [0] }, "i": { "x": [0.1], "y": [1] } });
+        let masked = with(
+            shape_layer(1, json!([rect(0.0, 0.0, 100.0, 100.0), fill(100.0)])),
+            json!({
+                "masksProperties": [
+                    { "mode": "a", "pt": growing_square(slow), "o": { "a": 0, "k": 100 } },
+                ],
+            }),
+        );
+        let events = render(&composition(json!([masked])), 10.0, 1.0);
+        let clips: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::PushClip(bounds) => Some(*bounds),
+                _ => None,
+            })
+            .collect();
+        // The composition and the mask.
+        assert_eq!(clips.len(), 2);
+        let side = clips[1].width();
+        assert!((side - 22.2).abs() < 0.05, "{side}");
+    }
+
     #[test]
     fn trim_path_measures_each_curve_once() {
         use crate::runtime::trim::SEGMENTS_MEASURED;

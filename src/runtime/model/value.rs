@@ -82,6 +82,11 @@ impl Easing {
         o: EasingHandle { x: 0.0, y: 0.0 },
         i: EasingHandle { x: 1.0, y: 1.0 },
     };
+
+    /// Whether the easing curve is the straight line from start to end.
+    pub(crate) fn is_linear(&self) -> bool {
+        self.o.x == self.o.y && self.i.x == self.i.y
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
