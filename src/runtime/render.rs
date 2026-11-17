@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 use super::model::{
-    Content, Draw, Geometry, GroupTransform, ImageAsset, RepeaterComposite, Shape, fixed,
+    Content, Draw, Geometry, GroupTransform, ImageAsset, Layer, RepeaterComposite, Shape, fixed,
 };
 use super::{
     Composition, EvaluatedComposition, EvaluatedLayer, EvaluationError, FilterEffect,
@@ -236,12 +236,23 @@ impl Renderer {
         let isolate_opacity =
             (alpha != 1.0 && (!layer.effects.is_empty() || draw_calls > 1)) || isolate_blending;
 
-        if isolate_opacity {
-            scene.push_layer(Mix::Normal, alpha as f32, parent_transform, &full_rect);
+        // A precomposition shows nothing outside its own bounds. The opacity layer can clip to
+        // them as well.
+        let precomp_clip = match &layer.content {
+            Content::Instance { .. } => precomposition_clip(layer, transform, clip_bounds),
+            _ => None,
+        };
+        match (isolate_opacity, &precomp_clip) {
+            (true, Some(clip)) => scene.push_layer(Mix::Normal, alpha as f32, transform, clip),
+            (true, None) => {
+                scene.push_layer(Mix::Normal, alpha as f32, parent_transform, &full_rect);
+            }
+            (false, Some(clip)) => scene.push_clip_layer(transform, clip),
+            (false, None) => {}
         }
 
         let alpha = if isolate_opacity { 1.0 } else { alpha };
-        let mut filter_layers = usize::from(isolate_opacity);
+        let mut filter_layers = usize::from(isolate_opacity || precomp_clip.is_some());
 
         for effect in layer
             .effects
@@ -354,6 +365,28 @@ impl Renderer {
             }
         }
     }
+}
+
+/// Returns the bounds, in layer coordinates, that a precomposition layer has to be clipped to.
+///
+/// Returns `None` when they already cover everything inside the composition clip, which saves
+/// the clip layer for the common precomposition that fills the composition.
+fn precomposition_clip(layer: &Layer, transform: Affine, clip_bounds: &Rect) -> Option<Rect> {
+    let bounds = Rect::new(0.0, 0.0, layer.width.max(0.0), layer.height.max(0.0));
+    let to_layer = transform.inverse();
+    let covered = to_layer.is_finite() && {
+        // Tolerates rounding in the transform when the edges coincide.
+        let bounds = bounds.inflate(1e-6, 1e-6);
+        [
+            (clip_bounds.x0, clip_bounds.y0),
+            (clip_bounds.x1, clip_bounds.y0),
+            (clip_bounds.x1, clip_bounds.y1),
+            (clip_bounds.x0, clip_bounds.y1),
+        ]
+        .into_iter()
+        .all(|corner| bounds.contains(to_layer * kurbo::Point::from(corner)))
+    };
+    (!covered).then_some(bounds)
 }
 
 /// Limits an opacity to the range it can be composited with. `NaN` counts as transparent.
@@ -503,7 +536,15 @@ impl Batch {
         let geometry_start = self.geometries.len();
         let draw_start = self.draws.len();
         for shape in shapes {
+            // A hidden shape is not drawn, but its paths are part of the layer's paths.
+            let shape = match shape {
+                Shape::Hidden(_) if collect_draws => continue,
+                Shape::Hidden(shape) => shape.as_ref(),
+                shape => shape,
+            };
             match shape {
+                // Nothing wraps a hidden shape a second time.
+                Shape::Hidden(_) => {}
                 Shape::Group(shapes, group_transform) => {
                     let (group_transform, group_alpha) =
                         if let Some(GroupTransform { transform, opacity }) = group_transform {
@@ -1929,5 +1970,250 @@ mod tests {
                 (false, Rect::new(0.0, 0.0, 20.0, 20.0)),
             ]
         );
+    }
+
+    fn draw_bounds(events: &[Event]) -> Vec<Rect> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Draw { bounds, .. } => Some(*bounds),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn hidden(shape: serde_json::Value) -> serde_json::Value {
+        with(shape, json!({ "hd": true }))
+    }
+
+    #[test]
+    fn hidden_geometry_is_not_drawn() {
+        let shapes = json!([
+            hidden(rect(0.0, 0.0, 10.0, 10.0)),
+            rect(20.0, 20.0, 30.0, 30.0),
+            fill(100.0),
+        ]);
+        let events = render(&composition(json!([shape_layer(1, shapes)])), 0.0, 1.0);
+        assert_eq!(draw_bounds(&events), [Rect::new(20.0, 20.0, 30.0, 30.0)]);
+    }
+
+    #[test]
+    fn hidden_style_draws_nothing() {
+        let shapes = json!([
+            rect(0.0, 0.0, 10.0, 10.0),
+            hidden(fill(100.0)),
+            stroke(100.0),
+            hidden(gradient("gf", 100.0)),
+        ]);
+        assert_eq!(
+            trace(&composition(json!([shape_layer(1, shapes)])), 0.0),
+            ["clip", "stroke(1)", "pop"]
+        );
+    }
+
+    #[test]
+    fn hidden_group_is_not_rendered() {
+        let shapes = json!([
+            hidden(group(vec![rect(0.0, 0.0, 10.0, 10.0), fill(100.0)], 100.0)),
+            rect(20.0, 20.0, 30.0, 30.0),
+            fill(100.0),
+        ]);
+        let events = render(&composition(json!([shape_layer(1, shapes)])), 0.0, 1.0);
+        // The geometry of the hidden group does not reach the fill after it either.
+        assert_eq!(draw_bounds(&events), [Rect::new(20.0, 20.0, 30.0, 30.0)]);
+    }
+
+    #[test]
+    fn hidden_trim_leaves_paths_whole() {
+        let line = json!({
+            "ty": "sh",
+            "ks": {
+                "a": 0,
+                "k": {
+                    "c": false,
+                    "v": [[0, 0], [40, 0]],
+                    "i": [[0, 0], [0, 0]],
+                    "o": [[0, 0], [0, 0]],
+                },
+            },
+        });
+        let trim = json!({
+            "ty": "tm",
+            "s": { "a": 0, "k": 0 },
+            "e": { "a": 0, "k": 50 },
+            "o": { "a": 0, "k": 0 },
+            "m": 1,
+        });
+        let bounds = |trim: serde_json::Value| {
+            let shapes = json!([line.clone(), stroke(100.0), trim]);
+            draw_bounds(&render(
+                &composition(json!([shape_layer(1, shapes)])),
+                0.0,
+                1.0,
+            ))
+        };
+        assert_eq!(bounds(trim.clone()), [Rect::new(0.0, 0.0, 20.0, 0.0)]);
+        assert_eq!(bounds(hidden(trim)), [Rect::new(0.0, 0.0, 40.0, 0.0)]);
+    }
+
+    #[test]
+    fn hidden_shapes_stay_in_path_queries() {
+        use kurbo::Shape as _;
+        let shapes = json!([
+            hidden(rect(0.0, 0.0, 10.0, 10.0)),
+            hidden(group(
+                vec![rect(20.0, 20.0, 30.0, 30.0), fill(100.0)],
+                100.0
+            )),
+            hidden(fill(100.0)),
+            rect(40.0, 40.0, 50.0, 50.0),
+            fill(100.0),
+        ]);
+        let composition = composition(json!([shape_layer(1, shapes)]));
+        // Only the visible rectangle is drawn.
+        let events = render(&composition, 0.0, 1.0);
+        assert_eq!(draw_bounds(&events), [Rect::new(40.0, 40.0, 50.0, 50.0)]);
+
+        // The paths of the layer include the hidden rectangle and that of the hidden group.
+        let all = [
+            Rect::new(0.0, 0.0, 10.0, 10.0),
+            Rect::new(20.0, 20.0, 30.0, 30.0),
+            Rect::new(40.0, 40.0, 50.0, 50.0),
+        ];
+        let evaluated = composition.evaluate(0.0).unwrap();
+        let layer = &evaluated.layers[0];
+        let bounds = |path: &kurbo::BezPath| path.bounding_box();
+        let evaluated_bounds: Vec<_> = layer.evaluated_paths().iter().map(bounds).collect();
+        assert_eq!(evaluated_bounds, all);
+        let authored = layer.authored_paths();
+        let authored_bounds: Vec<_> = authored
+            .iter()
+            .map(|path| path.elements.as_slice().bounding_box())
+            .collect();
+        assert_eq!(authored_bounds, all);
+        // Hidden shapes keep their place among the shapes of the layer.
+        let indices: Vec<_> = authored.iter().map(|path| path.indices.clone()).collect();
+        assert_eq!(indices, [vec![0], vec![1, 0], vec![3]]);
+    }
+
+    #[test]
+    fn hidden_trim_is_not_applied_to_queried_paths() {
+        use kurbo::Shape as _;
+        let line = json!({
+            "ty": "sh",
+            "ks": {
+                "a": 0,
+                "k": {
+                    "c": false,
+                    "v": [[0, 0], [40, 0]],
+                    "i": [[0, 0], [0, 0]],
+                    "o": [[0, 0], [0, 0]],
+                },
+            },
+        });
+        let trim = json!({
+            "ty": "tm",
+            "s": { "a": 0, "k": 0 },
+            "e": { "a": 0, "k": 50 },
+            "o": { "a": 0, "k": 0 },
+            "m": 1,
+        });
+        let bounds = |trim: serde_json::Value| {
+            let composition = composition(json!([shape_layer(1, json!([line.clone(), trim]))]));
+            let evaluated = composition.evaluate(0.0).unwrap();
+            evaluated.layers[0].evaluated_paths()[0].bounding_box()
+        };
+        assert_eq!(bounds(trim.clone()), Rect::new(0.0, 0.0, 20.0, 0.0));
+        assert_eq!(bounds(hidden(trim)), Rect::new(0.0, 0.0, 40.0, 0.0));
+    }
+
+    #[test]
+    fn gradient_opacity_fades_the_gradient() {
+        let shapes = json!([
+            rect(0.0, 0.0, 10.0, 10.0),
+            gradient("gf", 50.0),
+            gradient("gs", 25.0),
+        ]);
+        assert_eq!(
+            trace(&composition(json!([shape_layer(1, shapes)])), 0.0),
+            ["clip", "stroke(0.25)", "fill(0.5)", "pop"]
+        );
+    }
+
+    /// A precomposition with one layer that fills the whole composition.
+    fn filled_precomp(id: &str) -> serde_json::Value {
+        precomp(
+            id,
+            json!([shape_layer(
+                1,
+                json!([rect(0.0, 0.0, 100.0, 100.0), fill(100.0)])
+            )]),
+        )
+    }
+
+    fn moved(layer: serde_json::Value, x: f64, y: f64) -> serde_json::Value {
+        let ks = with(transform(100.0), json!({ "p": { "a": 0, "k": [x, y] } }));
+        with(layer, json!({ "ks": ks }))
+    }
+
+    #[test]
+    fn precomposition_is_clipped_to_its_size() {
+        let instance = with(precomp_layer(1, "comp"), json!({ "w": 40, "h": 30 }));
+        let composition = composition_with_assets(
+            json!([filled_precomp("comp")]),
+            json!([moved(instance, 10.0, 20.0)]),
+        );
+        let events = render(&composition, 0.0, 1.0);
+        assert_eq!(
+            trace(&composition, 0.0),
+            ["clip", "clip", "fill(1)", "pop", "pop"]
+        );
+        // The clip follows the transform of the precomposition layer.
+        assert!(events.contains(&Event::PushClip(Rect::new(10.0, 20.0, 50.0, 50.0))));
+    }
+
+    #[test]
+    fn precomposition_that_covers_the_composition_needs_no_clip() {
+        let assets = json!([filled_precomp("comp")]);
+        let covering = composition_with_assets(
+            assets.clone(),
+            json!([with(
+                precomp_layer(1, "comp"),
+                json!({ "w": 300, "h": 300 })
+            )]),
+        );
+        assert_eq!(trace(&covering, 0.0), ["clip", "fill(1)", "pop"]);
+        // Once it moves, part of the composition lies outside it.
+        let moved =
+            composition_with_assets(assets, json!([moved(precomp_layer(1, "comp"), 50.0, 0.0)]));
+        assert_eq!(
+            trace(&moved, 0.0),
+            ["clip", "clip", "fill(1)", "pop", "pop"]
+        );
+        assert!(
+            render(&moved, 0.0, 1.0).contains(&Event::PushClip(Rect::new(50.0, 0.0, 150.0, 100.0)))
+        );
+    }
+
+    #[test]
+    fn translucent_precomposition_clips_with_its_opacity_layer() {
+        let child = |ind| shape_layer(ind, json!([rect(0.0, 0.0, 100.0, 100.0), fill(100.0)]));
+        let instance = with(
+            with(precomp_layer(1, "comp"), json!({ "w": 40, "h": 30 })),
+            opacity(50.0),
+        );
+        let composition = composition_with_assets(
+            json!([precomp("comp", json!([child(1), child(2)]))]),
+            json!([instance]),
+        );
+        let events = render(&composition, 0.0, 1.0);
+        assert_eq!(
+            trace(&composition, 0.0),
+            ["clip", "layer(0.5)", "fill(1)", "fill(1)", "pop", "pop"]
+        );
+        assert!(matches!(
+            &events[2],
+            Event::PushLayer { bounds, .. } if *bounds == Rect::new(0.0, 0.0, 40.0, 30.0)
+        ));
     }
 }

@@ -242,6 +242,9 @@ pub enum Shape {
     Repeater(Repeater),
     /// Trim element.
     Trim(Trim),
+    /// Hidden geometry, style or group. It is not rendered, but its paths remain available
+    /// from [`EvaluatedLayer`](crate::EvaluatedLayer).
+    Hidden(Box<Shape>),
 }
 
 /// Evaluated authored transform values.

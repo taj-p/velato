@@ -113,19 +113,11 @@ impl Time {
         if times.is_empty() {
             return None;
         }
-        use core::cmp::Ordering::*;
-        let ix = match times.binary_search_by(|x| {
-            if x.frame < frame {
-                Less
-            } else if x.frame > frame {
-                Greater
-            } else {
-                Equal
-            }
-        }) {
-            Ok(ix) => ix,
-            Err(ix) => ix.saturating_sub(1),
-        };
+        // When several keyframes share a time, the last of them applies from that time on. A
+        // binary search may return any of them.
+        let ix = times
+            .partition_point(|x| x.frame <= frame)
+            .saturating_sub(1);
         let ix0 = ix.min(times.len() - 1);
         let ix1 = (ix0 + 1).min(times.len() - 1);
 
@@ -138,10 +130,13 @@ impl Time {
             i: EasingHandle { x: t0_ix, y: t0_iy },
         };
         let hold = t0.hold;
-        let t = if ix0 == ix1 {
-            0.0
+        // Keyframes that are out of order can still leave a span without length, which has no
+        // position to interpolate at.
+        let span = t1.frame - t0.frame;
+        let t = if span > 0.0 {
+            (frame - t0.frame) / span
         } else {
-            (frame - t0.frame) / (t1.frame - t0.frame)
+            0.0
         };
         Some(([ix0, ix1], t.clamp(0.0, 1.0), easing, hold))
     }

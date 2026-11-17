@@ -584,7 +584,7 @@ fn conv_draw(value: &schema::shapes::AnyShape) -> Option<runtime::model::Draw> {
             Some(Draw {
                 stroke: None,
                 brush,
-                opacity: Value::Fixed(100.0),
+                opacity: conv_scalar(&value.shape_style.opacity),
             })
         }
         AnyShape::GradientStroke(value) => {
@@ -632,14 +632,54 @@ fn conv_draw(value: &schema::shapes::AnyShape) -> Option<runtime::model::Draw> {
             Some(Draw {
                 stroke: Some(stroke.into_model()),
                 brush,
-                opacity: Value::Fixed(100.0),
+                opacity: conv_scalar(&value.shape_style.opacity),
             })
         }
         _ => None,
     }
 }
 
+/// Returns true if the shape is marked as hidden (`hd`).
+fn is_shape_hidden(value: &schema::shapes::AnyShape) -> bool {
+    use schema::shapes::AnyShape::*;
+    let element = match value {
+        Group(value) => &value.graphic_element,
+        Rectangle(value) => &value.shape.graphic_element,
+        Ellipse(value) => &value.shape.graphic_element,
+        Path(value) => &value.shape.graphic_element,
+        PolyStar(value) => &value.shape.graphic_element,
+        Transform(value) => &value.graphic_element,
+        Fill(value) => &value.shape_style.graphic_element,
+        Stroke(value) => &value.shape_style.graphic_element,
+        GradientFill(value) => &value.shape_style.graphic_element,
+        GradientStroke(value) => &value.shape_style.graphic_element,
+        Repeater(value) => &value.modifier.graphic_element,
+        Trim(value) => &value.modifier.graphic_element,
+        PuckerBloat(value) => &value.modifier.graphic_element,
+        OffsetPath(value) => &value.modifier.graphic_element,
+        Twist(value) => &value.modifier.graphic_element,
+        RoundedCorners(value) => &value.modifier.graphic_element,
+        Merge(value) => &value.graphic_element,
+    };
+    element.hidden == Some(true)
+}
+
 fn conv_shape(value: &schema::shapes::AnyShape) -> Option<crate::runtime::model::Shape> {
+    use crate::runtime::model::Shape;
+    let shape = conv_visible_shape(value)?;
+    if !is_shape_hidden(value) {
+        return Some(shape);
+    }
+    // A hidden shape takes no part in rendering: hidden geometry is not drawn, a hidden style
+    // draws nothing and a hidden group is left out with its content. These stay in the model
+    // for queries of the layer's paths. A hidden modifier is not applied at all.
+    match shape {
+        Shape::Repeater(_) | Shape::Trim(_) => None,
+        shape => Some(Shape::Hidden(Box::new(shape))),
+    }
+}
+
+fn conv_visible_shape(value: &schema::shapes::AnyShape) -> Option<crate::runtime::model::Shape> {
     match conv_draw(value) {
         Some(draw) => {
             return Some(crate::runtime::model::Shape::Draw(draw));
@@ -675,10 +715,6 @@ fn conv_shape(value: &schema::shapes::AnyShape) -> Option<crate::runtime::model:
         }
         schema::shapes::AnyShape::Repeater(value) => {
             use schema::constants::composite::Composite;
-
-            if value.modifier.graphic_element.hidden == Some(true) {
-                return None;
-            }
 
             let transform = &value.transform.transform.transform;
             let repeater = animated::Repeater {
@@ -1726,5 +1762,52 @@ mod tests {
         })));
         let middle = position.evaluate(5.0);
         assert!(middle.x > 4e24 && middle.x < 6e24, "{middle:?}");
+    }
+
+    #[test]
+    fn last_of_several_keyframes_at_one_time_applies() {
+        // The value jumps at frame 10, and the keyframe it jumps from holds its value.
+        let value = super::conv_scalar(&parse(json!({
+            "a": 1,
+            "k": [
+                { "t": 0, "s": [0] },
+                { "t": 10, "s": [100], "h": 1 },
+                { "t": 10, "s": [50] },
+                { "t": 20, "s": [60] },
+            ],
+        })));
+        assert_eq!(value.evaluate(10.0), 50.0);
+        assert!(close(value.evaluate(15.0), 55.0));
+        assert!(value.evaluate(9.0) > 50.0);
+    }
+
+    #[test]
+    fn shape_keyframes_at_one_time_evaluate_to_a_finite_path() {
+        let bezier = |x: f64| {
+            json!([{
+                "c": false,
+                "v": [[0, 0], [x, 0]],
+                "i": [[0, 0], [0, 0]],
+                "o": [[0, 0], [0, 0]],
+            }])
+        };
+        let geometry = super::conv_shape_geometry(&parse(json!({
+            "a": 1,
+            "k": [
+                { "t": 0, "s": bezier(10.0) },
+                { "t": 10, "s": bezier(20.0) },
+                { "t": 10, "s": bezier(30.0) },
+            ],
+        })))
+        .unwrap();
+        let mut path = vec![];
+        geometry.evaluate(10.0, &mut path);
+        assert_eq!(
+            path,
+            [
+                kurbo::PathEl::MoveTo(Point::new(0.0, 0.0)),
+                kurbo::PathEl::LineTo(Point::new(30.0, 0.0)),
+            ]
+        );
     }
 }

@@ -291,6 +291,19 @@ pub(crate) fn stroke(opacity: f64) -> Value {
     })
 }
 
+/// A linear gradient from red to black, for a gradient fill (`gf`) or gradient stroke (`gs`).
+pub(crate) fn gradient(ty: &str, opacity: f64) -> Value {
+    json!({
+        "ty": ty,
+        "o": { "a": 0, "k": opacity },
+        "w": { "a": 0, "k": 2 },
+        "t": 1,
+        "s": { "a": 0, "k": [0, 0] },
+        "e": { "a": 0, "k": [10, 0] },
+        "g": { "p": 2, "k": { "a": 0, "k": [0, 1, 0, 0, 1, 0, 0, 0] } },
+    })
+}
+
 /// A shape group holding `items`, followed by a group transform that only sets the opacity.
 pub(crate) fn group(mut items: Vec<Value>, opacity: f64) -> Value {
     items.push(with(transform(opacity), json!({ "ty": "tr" })));

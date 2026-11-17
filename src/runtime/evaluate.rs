@@ -103,6 +103,10 @@ impl EvaluatedLayer<'_> {
         ) {
             for (index, shape) in shapes.iter().enumerate() {
                 indices.push(index);
+                let shape = match shape {
+                    Shape::Hidden(shape) => shape.as_ref(),
+                    shape => shape,
+                };
                 match shape {
                     Shape::Geometry(geometry) => {
                         let mut elements = Vec::new();

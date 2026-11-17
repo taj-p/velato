@@ -47,6 +47,10 @@ This release has an [MSRV][] of 1.88.
 - Opacity now applies to a layer, precomposition, shape group or repeater copy as a whole, and the `alpha` passed to the renderer to the whole animation. Content with more than one draw call is rendered into a layer first, so overlapping shapes no longer show through each other; a single draw call still takes the opacity in its brush.
 - Import no longer panics on split rotations, split positions in group transforms, easing handles with several or no values, or the `Add` and `HardMix` blend modes. A split rotation uses its Z component and an easing handle its first value.
 - Rendering no longer panics on a polystar point count or repeater copy count too large to hold in memory, which now draw nothing, or on trim paths and spatial position keyframes over extremely long curves.
+- Hidden shapes (`hd`) are no longer rendered: hidden geometry and hidden styles draw nothing, a hidden group is left out with its content, and a hidden trim path is not applied, as hidden repeaters already were not. For groups, trim paths and repeaters this follows the Lottie specification; lottie-web 5.7.14 ignores `hd` on them. Hidden geometry, styles and groups stay in the model as `Shape::Hidden`, so `EvaluatedLayer::evaluated_paths()` and `authored_paths()` still include them.
+- Gradient fills and gradient strokes now apply their opacity (`o`).
+- Precomposition layers are now clipped to their width and height. A precomposition that covers the composition needs no clip and pushes none.
+- Keyframe lookup no longer depends on which of several keyframes at the same time a binary search returns. The last one applies from that time on, and a span without length is never interpolated.
 - Keyframes without a start value (`s`) now import. Older exporters end each animated property with a keyframe that holds only a time; it takes the previous keyframe's end value (`e`).
 
 ## [0.12.0][] (2026-09-09)
