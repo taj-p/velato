@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 use super::{Easing, Time, Tween};
+use crate::runtime::trim::measurable;
 use kurbo::{
-    Affine, CubicBez, ParamCurve, ParamCurveArclen, ParamCurveDeriv, ParamCurveExtrema, Point, Vec2,
+    CubicBez, ParamCurve, ParamCurveArclen, ParamCurveDeriv, ParamCurveExtrema, PathSeg, Point,
+    Vec2,
 };
 
 #[derive(Clone, Debug)]
@@ -19,8 +21,8 @@ pub struct SpatialKeyframe {
 #[derive(Clone, Debug)]
 struct MotionPath {
     curve: CubicBez,
-    /// The curve to measure: `curve`, scaled down if its coordinates are extreme.
-    measured: CubicBez,
+    /// The curve to measure: `curve`, or a scaled copy of it if its extent is extreme.
+    measured: PathSeg,
     /// Length of `measured`.
     arc_length: f64,
     accuracy: f64,
@@ -70,11 +72,6 @@ impl SpatialPosition {
         }
     }
 
-    // kurbo squares coordinates while it measures a curve, which overflows above about 1e154
-    // and keeps it from converging. Curves with larger coordinates than this are measured
-    // scaled down.
-    const MAX_MAGNITUDE: f64 = 1e100;
-
     pub fn new(keyframes: Vec<SpatialKeyframe>) -> Self {
         let paths = keyframes
             .windows(2)
@@ -95,23 +92,24 @@ impl SpatialPosition {
                 if Self::is_linear(&curve) {
                     return None;
                 }
-                let magnitude = [curve.p0, curve.p1, curve.p2, curve.p3]
-                    .iter()
-                    .fold(0.0_f64, |m, p| m.max(p.x.abs()).max(p.y.abs()));
-                let scale = if magnitude.is_finite() && magnitude > Self::MAX_MAGNITUDE {
-                    2.0_f64.powi(-(magnitude.log2().ceil() as i32))
-                } else {
-                    1.0
+                // kurbo squares the differences between the points of a curve while it
+                // measures it. For a very large curve they overflow, and for a very small one
+                // they underflow, and either keeps it from converging. Such curves are
+                // measured scaled.
+                let (measured, scale) = measurable(PathSeg::Cubic(curve));
+                let control_length = match measured {
+                    PathSeg::Cubic(fitted) => {
+                        (fitted.p1 - fitted.p0).hypot()
+                            + (fitted.p2 - fitted.p1).hypot()
+                            + (fitted.p3 - fitted.p2).hypot()
+                    }
+                    _ => unreachable!("a cubic stays a cubic"),
                 };
-                let measured = Affine::scale(scale) * curve;
-                let control_length = (measured.p1 - measured.p0).hypot()
-                    + (measured.p2 - measured.p1).hypot()
-                    + (measured.p3 - measured.p2).hypot();
                 let accuracy = (Self::ACCURACY * scale)
                     .min(control_length * Self::RELATIVE_ACCURACY)
                     .max(control_length * Self::MIN_RELATIVE_ACCURACY)
                     .max(f64::MIN_POSITIVE);
-                let arc_length = if measured.is_finite() {
+                let arc_length = if curve.is_finite() {
                     measured.arclen(accuracy)
                 } else {
                     f64::NAN
@@ -203,5 +201,27 @@ mod tests {
         // Halfway along the first arc, which bulges away from the X axis.
         assert!((middle.x / size - 0.5).abs() < 1e-6, "{middle:?}");
         assert!(middle.y / size > 0.5, "{middle:?}");
+    }
+
+    #[test]
+    fn motion_paths_of_any_extent_are_measured() {
+        // The squares of differences this small are zero, and of ones this large not finite.
+        for size in [1e-160, 1e-120, 1.0, 1e160, 1e307] {
+            let keyframes: Vec<_> = (0..40)
+                .map(|index| {
+                    let x = f64::from(index) * size;
+                    keyframe(f64::from(index), Point::new(x, 0.0), Vec2::new(0.0, size))
+                })
+                .collect();
+            let start = Instant::now();
+            let position = SpatialPosition::new(keyframes);
+            let middle = position.evaluate(0.5);
+            assert!(start.elapsed() < Duration::from_secs(1), "size {size}");
+            assert!(
+                (middle.x / size - 0.5).abs() < 1e-3,
+                "size {size}: {middle:?}"
+            );
+            assert!(middle.y / size > 0.5, "size {size}: {middle:?}");
+        }
     }
 }

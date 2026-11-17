@@ -1,7 +1,10 @@
 // Copyright 2026 the Velato Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-use kurbo::{Affine, ParamCurve, ParamCurveArclen, PathEl, PathSeg, segments};
+use kurbo::{
+    Affine, CubicBez, Line, ParamCurve, ParamCurveArclen, PathEl, PathSeg, Point, QuadBez, segments,
+};
+use std::ops::RangeInclusive;
 
 const ACCURACY: f64 = 0.1;
 // A segment is measured to `ACCURACY`, or to this fraction of the length of its control polygon
@@ -12,6 +15,78 @@ const RELATIVE_ACCURACY: f64 = 1e-9;
 // kurbo squares coordinates when it measures a curve, which overflows above about 1e154 and
 // keeps it from converging. Paths with larger coordinates than this are measured scaled down.
 const MAX_MAGNITUDE: f64 = 1e100;
+
+// kurbo also squares the differences between the points of a curve, and halves a curve up to
+// twenty times while it measures it. Below this range the squares underflow to zero, with the
+// same result as above it: kurbo subdivides every curve as far as it can. A segment whose
+// extent is outside this range is measured scaled into it.
+const MEASURABLE_EXTENT: RangeInclusive<f64> = 1e-100..=1e100;
+
+/// Returns a copy of the segment that kurbo can measure, and the factor that it was scaled by.
+///
+/// The copy is the segment itself unless its extent is outside of what kurbo can measure. Then
+/// it is the segment moved to start at the origin and scaled by a power of two. Its curve
+/// parameters are those of the segment, and its lengths are those of the segment times the
+/// factor.
+pub(crate) fn measurable(segment: PathSeg) -> (PathSeg, f64) {
+    let origin = segment.start();
+    // Halved, so that the difference between two coordinates of opposite sign stays finite.
+    let half = |point: Point| {
+        (point.x * 0.5 - origin.x * 0.5)
+            .abs()
+            .max((point.y * 0.5 - origin.y * 0.5).abs())
+    };
+    let half_extent = match segment {
+        PathSeg::Line(line) => half(line.p1),
+        PathSeg::Quad(quad) => half(quad.p1).max(half(quad.p2)),
+        PathSeg::Cubic(cubic) => half(cubic.p1).max(half(cubic.p2)).max(half(cubic.p3)),
+    };
+    let extent = 2.0 * half_extent;
+    if half_extent == 0.0 || !half_extent.is_finite() || MEASURABLE_EXTENT.contains(&extent) {
+        return (segment, 1.0);
+    }
+    // Powers of two up to 2^1000 and down to 2^-1000 are normal floats.
+    let exponent = (-half_extent.log2().ceil()).clamp(-1000.0, 1000.0);
+    let scale = 2.0_f64.powi(exponent as i32);
+    // Scaling down comes before moving, and scaling up after it, so that neither overflows.
+    let (before, after) = if scale < 1.0 {
+        (scale, 1.0)
+    } else {
+        (1.0, scale)
+    };
+    let fit = |point: Point| {
+        Point::new(
+            (point.x * before - origin.x * before) * after,
+            (point.y * before - origin.y * before) * after,
+        )
+    };
+    let fitted = match segment {
+        PathSeg::Line(line) => PathSeg::Line(Line::new(fit(line.p0), fit(line.p1))),
+        PathSeg::Quad(quad) => {
+            PathSeg::Quad(QuadBez::new(fit(quad.p0), fit(quad.p1), fit(quad.p2)))
+        }
+        PathSeg::Cubic(cubic) => PathSeg::Cubic(CubicBez::new(
+            fit(cubic.p0),
+            fit(cubic.p1),
+            fit(cubic.p2),
+            fit(cubic.p3),
+        )),
+    };
+    (fitted, scale)
+}
+
+/// Returns the length of a segment of a path that was scaled by `scale`.
+fn segment_length(segment: PathSeg, scale: f64) -> f64 {
+    let (fitted, fit) = measurable(segment);
+    fitted.arclen(accuracy(&fitted, scale * fit)) / fit
+}
+
+/// Returns the parameter at which a segment of a path that was scaled by `scale` reaches the
+/// given length.
+fn segment_parameter(segment: PathSeg, length: f64, scale: f64) -> f64 {
+    let (fitted, fit) = measurable(segment);
+    fitted.inv_arclen(length * fit, accuracy(&fitted, scale * fit))
+}
 
 /// Returns the accuracy to measure a segment with, for a path that was scaled by `scale`.
 fn accuracy(segment: &PathSeg, scale: f64) -> f64 {
@@ -24,7 +99,10 @@ fn accuracy(segment: &PathSeg, scale: f64) -> f64 {
                 + (cubic.p3 - cubic.p2).hypot()
         }
     };
-    (ACCURACY * scale).max(control_length * RELATIVE_ACCURACY)
+    // An accuracy of zero cannot be met, and makes kurbo subdivide as far as it can.
+    (ACCURACY * scale)
+        .max(control_length * RELATIVE_ACCURACY)
+        .max(f64::MIN_POSITIVE)
 }
 
 /// Returns the factor to scale a path by before measuring it: 1 for all but extreme coordinates,
@@ -58,7 +136,9 @@ fn measuring_scale(elements: &[PathEl]) -> Option<f64> {
     if !finite {
         None
     } else if magnitude > MAX_MAGNITUDE {
-        Some(2.0_f64.powi(-(magnitude.log2().ceil() as i32)))
+        // A power of two below 2^-1022 is not a normal float, and comes out as zero.
+        let exponent = (magnitude.log2().ceil() as i32).min(1022);
+        Some(2.0_f64.powi(-exponent))
     } else {
         Some(1.0)
     }
@@ -66,7 +146,7 @@ fn measuring_scale(elements: &[PathEl]) -> Option<f64> {
 
 fn scaled_length(elements: &[PathEl], scale: f64) -> f64 {
     segments(elements.iter().copied())
-        .map(|segment| segment.arclen(accuracy(&segment, scale)))
+        .map(|segment| segment_length(segment, scale))
         .sum()
 }
 
@@ -162,7 +242,7 @@ fn trim_contour(
     output: &mut Vec<PathEl>,
 ) {
     let segments: Vec<_> = segments(elements.iter().copied())
-        .map(|seg| (seg, seg.arclen(accuracy(&seg, scale))))
+        .map(|segment| (segment, segment_length(segment, scale)))
         .collect();
     let closed = matches!(elements.last(), Some(PathEl::ClosePath));
     let mut previous_end = None;
@@ -175,18 +255,15 @@ fn trim_contour(
             }
             let next = position + segment_length;
             if segment_length > 0.0 && next > start && position < end {
-                let accuracy = accuracy(&segment, scale);
                 let t0 = if start <= position {
                     0.0
                 } else {
-                    segment
-                        .inv_arclen(start - position, accuracy)
-                        .clamp(0.0, 1.0)
+                    segment_parameter(segment, start - position, scale).clamp(0.0, 1.0)
                 };
                 let t1 = if end >= next {
                     1.0
                 } else {
-                    segment.inv_arclen(end - position, accuracy).clamp(0.0, 1.0)
+                    segment_parameter(segment, end - position, scale).clamp(0.0, 1.0)
                 };
                 if t1 > t0 {
                     let sub = segment.subsegment(t0..t1);
@@ -263,6 +340,53 @@ mod tests {
             let half = trimmed_half(&path);
             let end = half.as_slice().bounding_box().x1 / size;
             assert!((end - 4.0).abs() < 0.01, "size {size}: half ends at {end}");
+        }
+    }
+
+    #[test]
+    fn path_with_coordinates_that_are_far_apart_in_size_is_measured() {
+        // The first curve reaches the largest coordinates a float can hold, and the others are
+        // a hundred and fifty orders of magnitude smaller. Scaled so that the first can be
+        // measured, the others are too small to measure without scaling them back up.
+        let mut path = curvy(40, 1e150);
+        path[1] = PathEl::CurveTo(
+            Point::new(1e308, 1e150),
+            Point::new(0.5e150, -1e150),
+            Point::new(1e150, 0.0),
+        );
+        let start = Instant::now();
+        let total = length(&path);
+        let half = trimmed_half(&path);
+        assert!(start.elapsed() < Duration::from_secs(1));
+        // The first curve goes out to its far control point and back, and outweighs the rest.
+        assert!(total > 0.5e308 && total < 1e308, "{total}");
+        assert!(!half.is_empty() && half.len() <= 2, "{half:?}");
+
+        // The same for a path that is small as a whole, and for one with a few such curves.
+        // A length far below the accuracy of a tenth of a unit is only estimated.
+        for size in [1e-150, 1e-300] {
+            let reference = length(&curvy(8, 100.0)) / 100.0;
+            let small = curvy(8, size);
+            let start = Instant::now();
+            let relative = length(&small) / size;
+            let half = trimmed_half(&small);
+            assert!(start.elapsed() < Duration::from_secs(1), "size {size}");
+            assert!(
+                (relative / reference - 1.0).abs() < 0.05,
+                "size {size}: {relative} for {reference}"
+            );
+            assert!((5..=6).contains(&half.len()), "size {size}: {half:?}");
+
+            // The small curves end next to the origin, where the others start.
+            let mut mixed = curvy(8, size);
+            mixed.extend(curvy(8, 100.0).into_iter().skip(1));
+            let start = Instant::now();
+            let mixed_length = length(&mixed);
+            assert!(start.elapsed() < Duration::from_secs(1), "size {size}");
+            assert!(
+                (mixed_length / 100.0 - reference).abs() < 0.05,
+                "size {size}"
+            );
         }
     }
 
