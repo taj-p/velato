@@ -485,9 +485,11 @@ fn orientation_z(transform: &schema::helpers::transform::Transform) -> Option<Va
                     // and at a constant speed, whatever the easing of the keyframe. Angles
                     // that differ by whole turns are the same orientation, so each keyframe
                     // is moved by whole turns to where the short way from the keyframe before
-                    // it ends. Of the two ways of a half turn, lottie-web takes the one that
-                    // the angles are written with, or the other if they are an odd number of
-                    // whole turns further apart.
+                    // it ends. Of the two ways of a half turn, the one that the angles are
+                    // written with is taken: from 0 to 540 degrees is half a turn forwards.
+                    // lottie-web decides between the two by the sign of a number that is
+                    // zero but for the rounding of sines and cosines. For most angles that
+                    // comes to the same, and for some, like 300 to 120 degrees, it does not.
                     for time in &mut animated.times {
                         time.in_tangent = None;
                         time.out_tangent = None;
@@ -498,7 +500,10 @@ fn orientation_z(transform: &schema::helpers::transform::Transform) -> Option<Va
                     for value in &mut animated.values {
                         let difference = *value - written;
                         written = *value;
-                        turned += difference - 360.0 * (difference / 360.0).round_ties_even();
+                        // The whole turns to leave out, with a half rounded toward zero.
+                        let turns = difference / 360.0;
+                        let whole = (turns.abs() - 0.5).ceil().copysign(turns);
+                        turned += difference - 360.0 * whole;
                         *value = turned;
                     }
                 }
@@ -2366,6 +2371,41 @@ mod tests {
             about(0.0, 0.0, 30.0),
         );
         assert!(close(rotation_at(rotating, 5.0).0, 75.0));
+        // A half turn is made the way the angles are written, also when they are whole
+        // turns further apart.
+        for (from, to, halfway) in [
+            (0.0, 180.0, 90.0),
+            (0.0, -180.0, -90.0),
+            (0.0, 540.0, 90.0),
+            (0.0, -540.0, -90.0),
+            (10.0, 550.0, 100.0),
+            (0.0, 900.0, 90.0),
+            (20.0, 200.0, 110.0),
+            (200.0, 20.0, 110.0),
+            (270.0, 90.0, 180.0),
+            (-30.0, 150.0, 60.0),
+            (300.0, 120.0, 210.0),
+            // Anything else goes the short way.
+            (0.0, 539.0, 89.5),
+            (0.0, 541.0, -89.5),
+            (0.0, -539.0, -89.5),
+            (0.0, 179.0, 89.5),
+            (0.0, 181.0, -89.5),
+        ] {
+            let half_turn = oriented(rotation_3d(0.0, 0.0, fixed(0.0)), turning(from, to));
+            let rotation = rotation_at(half_turn, 5.0).0;
+            assert!(close(rotation, halfway), "{from} to {to}: {rotation}");
+        }
+        // Each keyframe turns from where the one before it ended.
+        let twice = json!({ "a": 1, "k": [
+            { "t": 0, "s": [0, 0, 0] },
+            { "t": 10, "s": [0, 0, 540] },
+            { "t": 20, "s": [0, 0, 0] },
+        ] });
+        let twice = oriented(rotation_3d(0.0, 0.0, fixed(0.0)), twice);
+        assert!(close(rotation_at(twice.clone(), 10.0).0, 180.0));
+        assert!(close(rotation_at(twice.clone(), 15.0).0, 90.0));
+        assert!(close(rotation_at(twice, 20.0).0, 0.0));
         // If both are, one rotation cannot hold their sum. The orientation is left out and
         // reported, unless it stays at zero.
         let unsupported = oriented(rotation_3d(0.0, 0.0, keyframes.clone()), turning(0.0, 90.0));
