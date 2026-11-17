@@ -869,9 +869,18 @@ impl Batch {
         };
         let first_scope = self.next_scope;
         self.next_scope = first_scope.wrapping_add(repeater.copies);
-        let copy_scope = |copy: usize, i: usize| OpacityScope {
-            id: first_scope.wrapping_add(copy),
-            alpha: unit_alpha(start_alpha + delta_alpha * i as f64),
+        // The opacity goes from start to end along the copies in the order they are stacked
+        // in, as it does in lottie-web. With copies above, the copy that the transform of the
+        // repeater is applied to most often is stacked first and takes the start opacity.
+        let copy_scope = |copy: usize, i: usize| {
+            let step = match repeater.composite {
+                RepeaterComposite::Below => i,
+                RepeaterComposite::Above => repeater.copies - 1 - i,
+            };
+            OpacityScope {
+                id: first_scope.wrapping_add(copy),
+                alpha: unit_alpha(start_alpha + delta_alpha * step as f64),
+            }
         };
         // Later styles traverse geometry directly, so it must be in paint order too.
         for copy in 0..repeater.copies {
@@ -1901,6 +1910,32 @@ mod tests {
         // Every copy still draws with the gradient.
         let events = render(&composition, 0.0, 1.0);
         assert_eq!(draw_bounds(&events).len(), 200);
+    }
+
+    #[test]
+    fn repeater_opacity_runs_along_the_copies_in_stacking_order() {
+        // Three copies, 30 units apart, that fade from full opacity to none.
+        let alphas_by_position = |composite: u8| {
+            let shapes = json!([
+                rect(0.0, 0.0, 10.0, 10.0),
+                fill(100.0),
+                with(repeater(3, 30.0, 100.0, 0.0), json!({ "m": composite })),
+            ]);
+            let events = render(&composition(json!([shape_layer(1, shapes)])), 0.0, 1.0);
+            let mut alphas: Vec<_> = events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Draw { alpha, bounds, .. } => Some((bounds.x0, *alpha)),
+                    _ => None,
+                })
+                .collect();
+            alphas.sort_by(|a, b| a.0.total_cmp(&b.0));
+            alphas
+        };
+        // The copy at the end of the row is transparent and is not drawn.
+        assert_eq!(alphas_by_position(1), [(0.0, 1.0), (30.0, 0.5)]);
+        // With the copies stacked the other way, the opacity runs the other way too.
+        assert_eq!(alphas_by_position(2), [(30.0, 0.5), (60.0, 1.0)]);
     }
 
     #[test]
