@@ -3,7 +3,7 @@
 
 use super::{Easing, Time, Tween};
 use kurbo::{
-    CubicBez, ParamCurve, ParamCurveArclen, ParamCurveDeriv, ParamCurveExtrema, Point, Vec2,
+    Affine, CubicBez, ParamCurve, ParamCurveArclen, ParamCurveDeriv, ParamCurveExtrema, Point, Vec2,
 };
 
 #[derive(Clone, Debug)]
@@ -19,6 +19,9 @@ pub struct SpatialKeyframe {
 #[derive(Clone, Debug)]
 struct MotionPath {
     curve: CubicBez,
+    /// The curve to measure: `curve`, scaled down if its coordinates are extreme.
+    measured: CubicBez,
+    /// Length of `measured`.
     arc_length: f64,
     accuracy: f64,
 }
@@ -67,6 +70,11 @@ impl SpatialPosition {
         }
     }
 
+    // kurbo squares coordinates while it measures a curve, which overflows above about 1e154
+    // and keeps it from converging. Curves with larger coordinates than this are measured
+    // scaled down.
+    const MAX_MAGNITUDE: f64 = 1e100;
+
     pub fn new(keyframes: Vec<SpatialKeyframe>) -> Self {
         let paths = keyframes
             .windows(2)
@@ -87,20 +95,30 @@ impl SpatialPosition {
                 if Self::is_linear(&curve) {
                     return None;
                 }
-                let control_length = (curve.p1 - curve.p0).hypot()
-                    + (curve.p2 - curve.p1).hypot()
-                    + (curve.p3 - curve.p2).hypot();
-                let accuracy = Self::ACCURACY
+                let magnitude = [curve.p0, curve.p1, curve.p2, curve.p3]
+                    .iter()
+                    .fold(0.0_f64, |m, p| m.max(p.x.abs()).max(p.y.abs()));
+                let scale = if magnitude.is_finite() && magnitude > Self::MAX_MAGNITUDE {
+                    2.0_f64.powi(-(magnitude.log2().ceil() as i32))
+                } else {
+                    1.0
+                };
+                let measured = Affine::scale(scale) * curve;
+                let control_length = (measured.p1 - measured.p0).hypot()
+                    + (measured.p2 - measured.p1).hypot()
+                    + (measured.p3 - measured.p2).hypot();
+                let accuracy = (Self::ACCURACY * scale)
                     .min(control_length * Self::RELATIVE_ACCURACY)
                     .max(control_length * Self::MIN_RELATIVE_ACCURACY)
                     .max(f64::MIN_POSITIVE);
-                let arc_length = if curve.is_finite() {
-                    curve.arclen(accuracy)
+                let arc_length = if measured.is_finite() {
+                    measured.arclen(accuracy)
                 } else {
                     f64::NAN
                 };
                 Some(MotionPath {
                     curve,
+                    measured,
                     arc_length,
                     accuracy,
                 })
@@ -142,8 +160,48 @@ impl SpatialPosition {
             return end.value;
         }
         let parameter = path
-            .curve
+            .measured
             .inv_arclen(progress * path.arc_length, path.accuracy);
         path.curve.eval(parameter)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn keyframe(frame: f64, value: Point, tangent: Vec2) -> SpatialKeyframe {
+        SpatialKeyframe {
+            time: Time {
+                frame,
+                in_tangent: None,
+                out_tangent: None,
+                hold: false,
+            },
+            value,
+            out_tangent: Some(tangent),
+            in_tangent: Some(tangent),
+        }
+    }
+
+    #[test]
+    fn motion_paths_with_extreme_coordinates_are_measured_scaled_down() {
+        // Measured as they are, the squares of these coordinates overflow, and kurbo then
+        // subdivides each path as far as it can.
+        let size = 1e200;
+        let keyframes: Vec<_> = (0..40)
+            .map(|index| {
+                let x = f64::from(index) * size;
+                keyframe(f64::from(index), Point::new(x, 0.0), Vec2::new(0.0, size))
+            })
+            .collect();
+        let start = Instant::now();
+        let position = SpatialPosition::new(keyframes);
+        let middle = position.evaluate(0.5);
+        assert!(start.elapsed() < Duration::from_secs(1));
+        // Halfway along the first arc, which bulges away from the X axis.
+        assert!((middle.x / size - 0.5).abs() < 1e-6, "{middle:?}");
+        assert!(middle.y / size > 0.5, "{middle:?}");
     }
 }
