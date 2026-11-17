@@ -84,6 +84,18 @@ impl Transform {
     }
 }
 
+/// Tolerance for approximating the arcs of an ellipse or of rounded corners with curves.
+const ARC_TOLERANCE: f64 = 0.1;
+
+/// The tolerance grows with shapes larger than this many times [`ARC_TOLERANCE`], so that the
+/// number of curves in an arc is bounded at any size. Shapes of ordinary size are not affected.
+const ARC_TOLERANCE_RANGE: f64 = 1e6;
+
+/// Returns the tolerance for the arcs of a shape that spans `extent`.
+fn arc_tolerance(extent: f64) -> f64 {
+    ARC_TOLERANCE.max(extent.abs() / ARC_TOLERANCE_RANGE)
+}
+
 /// Animated ellipse.
 #[derive(Clone, Debug)]
 pub struct Ellipse {
@@ -105,7 +117,10 @@ impl Ellipse {
         let center = self.position.evaluate(frame);
         let size = self.size.evaluate(frame);
         let ellipse = kurbo::Ellipse::new(center, (size.width * 0.5, size.height * 0.5), 0.0);
-        path.extend(ellipse.path_elements(0.1));
+        // The radii that kurbo derives for the arc can overflow where the size does not.
+        let radii = ellipse.radii();
+        let tolerance = arc_tolerance(2.0 * radii.x.max(radii.y));
+        path.extend(ellipse.path_elements(tolerance));
     }
 
     #[cfg(feature = "lottie-shape-paths")]
@@ -123,7 +138,8 @@ impl Ellipse {
             },
             x_rotation: 0.0,
         };
-        path.extend(arc.path_elements(0.1));
+        let tolerance = arc_tolerance(size.width.abs().max(size.height.abs()));
+        path.extend(arc.path_elements(tolerance));
         path.push(PathEl::ClosePath);
     }
 }
@@ -158,7 +174,8 @@ impl Rect {
             center.y + size.height * 0.5,
             self.corner_radius.evaluate(frame),
         );
-        path.extend(rect.path_elements(0.1));
+        let tolerance = arc_tolerance(size.width.abs().max(size.height.abs()));
+        path.extend(rect.path_elements(tolerance));
     }
 
     #[cfg(feature = "lottie-shape-paths")]
@@ -177,7 +194,8 @@ impl Rect {
             .max(0.0);
         use kurbo::ParamCurve;
 
-        let outline = kurbo::RoundedRect::new(left, top, right, bottom, radius).to_path(0.1);
+        let tolerance = arc_tolerance(size.width.abs().max(size.height.abs()));
+        let outline = kurbo::RoundedRect::new(left, top, right, bottom, radius).to_path(tolerance);
         let mut segments: Vec<_> = outline.segments().collect();
         let start = Point::new(right, top + radius);
         // Lottie starts at the top-right; choose the nearest endpoint to tolerate arc rounding.
@@ -648,5 +666,63 @@ impl Trim {
         } else {
             super::Trim::Animated(self)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ellipse(size: f64) -> Vec<PathEl> {
+        let ellipse = Ellipse {
+            is_ccw: false,
+            position: Position::Value(Value::Fixed(Point::new(0.0, 0.0))),
+            size: Value::Fixed(Size::new(size, size)),
+        };
+        let mut path = Vec::new();
+        ellipse.evaluate(0.0, &mut path);
+        path
+    }
+
+    fn rounded_rect(size: f64) -> Vec<PathEl> {
+        let rect = Rect {
+            is_ccw: false,
+            position: Position::Value(Value::Fixed(Point::new(0.0, 0.0))),
+            size: Value::Fixed(Size::new(size, size)),
+            corner_radius: Value::Fixed(size / 4.0),
+        };
+        let mut path = Vec::new();
+        rect.evaluate(0.0, &mut path);
+        path
+    }
+
+    #[test]
+    fn arcs_have_a_bounded_number_of_curves_at_any_size() {
+        // With a fixed tolerance the number of curves grew with the size without limit.
+        for size in [1e30, 1e60, 1e300, f64::INFINITY, f64::NAN] {
+            let ellipse = ellipse(size).len();
+            assert!(ellipse <= 16, "ellipse of size {size}: {ellipse} elements");
+            let rect = rounded_rect(size).len();
+            assert!(
+                rect <= 24,
+                "rounded rectangle of size {size}: {rect} elements"
+            );
+        }
+    }
+
+    #[test]
+    fn arcs_of_ordinary_size_keep_their_tolerance() {
+        let curves = |path: &[PathEl]| {
+            path.iter()
+                .filter(|element| matches!(element, PathEl::CurveTo(..)))
+                .count()
+        };
+        for size in [1.0, 100.0, 10_000.0, 100_000.0] {
+            // The number of curves kurbo needs for this circle at a tolerance of 0.1.
+            let circle = kurbo::Circle::new((0.0, 0.0), size / 2.0);
+            let expected = curves(&circle.path_elements(0.1).collect::<Vec<_>>());
+            assert_eq!(curves(&ellipse(size)), expected, "size {size}");
+        }
+        assert_eq!(curves(&ellipse(100.0)), 4);
     }
 }
