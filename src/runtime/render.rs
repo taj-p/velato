@@ -435,6 +435,12 @@ struct DrawData {
 }
 
 impl DrawData {
+    /// Whether the path of this style holds the geometry.
+    fn includes(&self, geometry: &GeometryData) -> bool {
+        let even_odd_fill = self.stroke.is_none() && self.fill_rule == Fill::EvenOdd;
+        !(even_odd_fill && geometry.repeated_source)
+    }
+
     fn new(draw: &Draw, geometry: Range<usize>, frame: f64) -> Self {
         Self {
             stroke: draw
@@ -458,6 +464,10 @@ struct GeometryData {
     transform: Affine,
     // Sequential trimming follows copy indices independently of paint stacking.
     trim_order: usize,
+    /// Source geometry of a repeater that made copies of it. lottie-web's SVG renderer puts
+    /// such a path into a later style twice, which makes no difference to a stroke or a
+    /// non-zero fill, and cancels it in an even-odd fill.
+    repeated_source: bool,
 }
 
 /// A shape group or repeater copy whose opacity applies to its content as a whole.
@@ -587,6 +597,7 @@ impl Batch {
             elements: start..end,
             transform,
             trim_order: self.geometries.len(),
+            repeated_source: false,
         });
     }
 
@@ -605,8 +616,14 @@ impl Batch {
             .copies
             .checked_mul(geometry_count)
             .is_some_and(|total| self.geometries.try_reserve(total).is_ok());
-        if repeater.copies == 0 || !fits {
+        if !fits {
             self.geometries.truncate(geometry_start);
+            self.draws.truncate(draw_start);
+            return;
+        }
+        if repeater.copies == 0 {
+            // Without copies the styles before the repeater draw nothing. The source geometry
+            // stays where it is for the styles after the repeater.
             self.draws.truncate(draw_start);
             return;
         }
@@ -614,10 +631,16 @@ impl Batch {
             return;
         }
 
-        // First move the relevant ranges of geometries and draws into side
-        // buffers
+        // The source geometry stays in place, at its unrepeated position: a style that comes
+        // after the repeater draws it along with the copies. The styles before the repeater
+        // are only drawn as part of the copies.
         self.repeat_geometries
-            .extend(self.geometries.drain(geometry_start..));
+            .extend(self.geometries[geometry_start..].iter().cloned());
+        for geometry in &mut self.geometries[geometry_start..] {
+            geometry.repeated_source = true;
+            // A sequential trim after the repeater reaches the copies first.
+            geometry.trim_order += repeater.copies * geometry_count;
+        }
         self.repeat_draws.extend(self.draws.drain(draw_start..));
         let start_alpha = repeater.start_opacity / 100.0;
         let end_alpha = repeater.end_opacity / 100.0;
@@ -643,13 +666,14 @@ impl Batch {
                 let mut geometry = geometry.clone();
                 geometry.trim_order += i * geometry_count;
                 geometry.transform = transform * geometry.transform;
+                geometry.repeated_source = false;
                 self.geometries.push(geometry);
             }
         }
 
         // Draws are consumed in reverse, unlike geometries.
         for copy in (0..repeater.copies).rev() {
-            let copy_start = geometry_start + copy * geometry_count;
+            let copy_start = geometry_start + (copy + 1) * geometry_count;
             let i = match repeater.composite {
                 RepeaterComposite::Below => repeater.copies - 1 - copy,
                 RepeaterComposite::Above => copy,
@@ -762,7 +786,8 @@ impl Batch {
             let has_path = self.geometries[draw.geometry.clone()]
                 .iter()
                 .any(|geometry| {
-                    !geometry.elements.is_empty()
+                    draw.includes(geometry)
+                        && !geometry.elements.is_empty()
                         && (geometry.transform == draw.transform
                             || (style_inverse * geometry.transform).is_finite())
                 });
@@ -843,11 +868,14 @@ impl Batch {
         };
         let brush = modified_brush.as_ref().unwrap_or(&draw.brush);
         let geometry = &geometries[0];
-        let path = if geometries.len() == 1 && geometry.transform == draw.transform {
+        let path = if geometries.len() == 1
+            && geometry.transform == draw.transform
+            && draw.includes(geometry)
+        {
             &self.elements[geometry.elements.clone()]
         } else {
             path.clear();
-            for geometry in geometries {
+            for geometry in geometries.iter().filter(|geometry| draw.includes(geometry)) {
                 let elements = &self.elements[geometry.elements.clone()];
                 if geometry.transform == draw.transform {
                     path.extend_from_slice(elements);
@@ -1516,6 +1544,103 @@ mod tests {
             .collect();
         assert_eq!(draws, [(0.8, Rect::new(0.0, 0.0, 50.0, 10.0))]);
         assert_eq!(events.len(), 5, "no layer is pushed");
+    }
+
+    #[test]
+    fn style_after_a_repeater_also_draws_the_source_geometry() {
+        let bounds_of = |shapes: serde_json::Value| {
+            draw_bounds(&render(
+                &composition(json!([shape_layer(1, shapes)])),
+                0.0,
+                1.0,
+            ))
+        };
+        // With an offset no copy lies where the source is, so there is one rectangle more:
+        // the source at 0, and the copies at 20, 40 and 60.
+        let mut offset = repeater(3, 20.0, 100.0, 100.0);
+        offset["o"]["k"] = json!(1);
+        assert_eq!(
+            bounds_of(json!([
+                rect(0.0, 0.0, 10.0, 10.0),
+                offset.clone(),
+                fill(100.0)
+            ])),
+            [Rect::new(0.0, 0.0, 70.0, 10.0)]
+        );
+        // A style before the repeater is only drawn in the copies.
+        assert_eq!(
+            bounds_of(json!([rect(0.0, 0.0, 10.0, 10.0), fill(100.0), offset])),
+            [
+                Rect::new(60.0, 0.0, 70.0, 10.0),
+                Rect::new(40.0, 0.0, 50.0, 10.0),
+                Rect::new(20.0, 0.0, 30.0, 10.0),
+            ]
+        );
+    }
+
+    #[test]
+    fn repeater_without_copies_leaves_the_source_to_later_styles() {
+        let none = || repeater(0, 20.0, 100.0, 100.0);
+        let after = json!([rect(0.0, 0.0, 10.0, 10.0), none(), fill(100.0)]);
+        assert_eq!(
+            trace(&composition(json!([shape_layer(1, after)])), 0.0),
+            ["clip", "fill(1)", "pop"]
+        );
+        let before = json!([rect(0.0, 0.0, 10.0, 10.0), fill(100.0), none()]);
+        assert_eq!(
+            trace(&composition(json!([shape_layer(1, before)])), 0.0),
+            ["clip", "pop"]
+        );
+    }
+
+    #[test]
+    fn even_odd_fill_after_a_repeater_leaves_out_the_source_geometry() {
+        let bounds_of = |rule: u8, copies: u32| {
+            let mut offset = repeater(copies, 20.0, 100.0, 100.0);
+            offset["o"]["k"] = json!(1);
+            let shapes = json!([
+                rect(0.0, 0.0, 10.0, 10.0),
+                offset,
+                with(fill(100.0), json!({ "r": rule })),
+            ]);
+            draw_bounds(&render(
+                &composition(json!([shape_layer(1, shapes)])),
+                0.0,
+                1.0,
+            ))
+        };
+        // The source reaches the fill twice, which cancels under the even-odd rule.
+        assert_eq!(bounds_of(1, 1), [Rect::new(0.0, 0.0, 30.0, 10.0)]);
+        assert_eq!(bounds_of(2, 1), [Rect::new(20.0, 0.0, 30.0, 10.0)]);
+        // Without copies it reaches the fill once.
+        assert_eq!(bounds_of(2, 0), [Rect::new(0.0, 0.0, 10.0, 10.0)]);
+    }
+
+    #[test]
+    fn sequential_trim_after_a_repeater_reaches_the_copies_before_the_source() {
+        // Four squares share the trim: three copies and the source. Half of their length is
+        // the first two copies; the source, last in line, would only be drawn by a later style.
+        let trim = json!({
+            "ty": "tm",
+            "s": { "a": 0, "k": 0 },
+            "e": { "a": 0, "k": 50 },
+            "o": { "a": 0, "k": 0 },
+            "m": 2,
+        });
+        let shapes = json!([
+            rect(0.0, 0.0, 10.0, 10.0),
+            stroke(100.0),
+            repeater(3, 20.0, 100.0, 100.0),
+            trim,
+        ]);
+        let events = render(&composition(json!([shape_layer(1, shapes)])), 0.0, 1.0);
+        assert_eq!(
+            draw_bounds(&events),
+            [
+                Rect::new(20.0, 0.0, 30.0, 10.0),
+                Rect::new(0.0, 0.0, 10.0, 10.0)
+            ]
+        );
     }
 
     #[test]
