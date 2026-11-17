@@ -84,9 +84,27 @@ impl fmt::Display for Event {
 #[derive(Debug, Default)]
 pub(crate) struct RecordingSink {
     pub(crate) events: Vec<Event>,
+    /// Number of calls that were handed a transform, a path or a clip shape with a
+    /// coordinate that is not finite.
+    pub(crate) not_finite: usize,
 }
 
 impl RecordingSink {
+    /// Counts the call if its transform or its shape is not finite.
+    fn check_finite(&mut self, transform: Affine, shape: &impl Shape) {
+        let finite = shape.path_elements(0.1).all(|element| match element {
+            kurbo::PathEl::MoveTo(p) | kurbo::PathEl::LineTo(p) => p.is_finite(),
+            kurbo::PathEl::QuadTo(p1, p2) => p1.is_finite() && p2.is_finite(),
+            kurbo::PathEl::CurveTo(p1, p2, p3) => {
+                p1.is_finite() && p2.is_finite() && p3.is_finite()
+            }
+            kurbo::PathEl::ClosePath => true,
+        });
+        if !(finite && transform.is_finite()) {
+            self.not_finite += 1;
+        }
+    }
+
     /// Panics if a layer is popped that was never pushed, or if any layer is left open.
     pub(crate) fn assert_balanced(&self) {
         let mut depth = 0_usize;
@@ -112,6 +130,7 @@ impl RenderSink for RecordingSink {
         transform: Affine,
         shape: &impl Shape,
     ) {
+        self.check_finite(transform, shape);
         self.events.push(Event::PushLayer {
             blend: blend.into(),
             alpha,
@@ -120,6 +139,7 @@ impl RenderSink for RecordingSink {
     }
 
     fn push_clip_layer(&mut self, transform: Affine, shape: &impl Shape) {
+        self.check_finite(transform, shape);
         self.events.push(Event::PushClip(
             transform.transform_rect_bbox(shape.bounding_box()),
         ));
@@ -146,6 +166,7 @@ impl RenderSink for RecordingSink {
                 .fold(0.0, f32::max),
             Brush::Image(_) => 1.0,
         };
+        self.check_finite(transform, shape);
         self.events.push(Event::Draw {
             stroked: stroke.is_some(),
             fill_rule,
@@ -154,7 +175,8 @@ impl RenderSink for RecordingSink {
         });
     }
 
-    fn draw_image(&mut self, image: &ImageAsset, _transform: Affine, alpha: f64) {
+    fn draw_image(&mut self, image: &ImageAsset, transform: Affine, alpha: f64) {
+        self.check_finite(transform, &Rect::ZERO);
         self.events.push(Event::Image {
             id: image.id.clone(),
             alpha,
@@ -172,13 +194,25 @@ impl RenderSink for RecordingSink {
 
 /// Renders a frame with an identity transform and returns every call the sink received.
 ///
-/// Panics if evaluation fails or if layer pushes and pops do not balance.
+/// Panics if evaluation fails, if layer pushes and pops do not balance, or if the sink was
+/// handed something that is not finite.
 pub(crate) fn render(composition: &Composition, frame: f64, alpha: f64) -> Vec<Event> {
+    render_with(composition, frame, Affine::IDENTITY, alpha)
+}
+
+/// Like [`render`], with the transform passed to the renderer.
+pub(crate) fn render_with(
+    composition: &Composition,
+    frame: f64,
+    transform: Affine,
+    alpha: f64,
+) -> Vec<Event> {
     let mut sink = RecordingSink::default();
     Renderer::new()
-        .try_append(composition, frame, Affine::IDENTITY, alpha, &mut sink)
+        .try_append(composition, frame, transform, alpha, &mut sink)
         .expect("evaluation failed");
     sink.assert_balanced();
+    assert_eq!(sink.not_finite, 0, "{:?}", sink.events);
     sink.events
 }
 

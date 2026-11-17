@@ -47,8 +47,10 @@
 //!
 //! [`Composition::evaluate`](crate::Composition::evaluate) checks every limit for a
 //! composition that was put together in code as well. A layer that was imported keeps a record
-//! of the shapes that import counted for it. Code that changes the shapes of such a layer
-//! should make a new [`Layer`](crate::model::Layer) for them, which is counted afresh.
+//! of the shapes that import counted for it, and of whether its shapes and masks have paths
+//! that never change and are finite. Code that changes the shapes or masks of such a layer
+//! should make a new [`Layer`](crate::model::Layer) for them, which is counted and checked
+//! afresh.
 
 use std::fmt;
 

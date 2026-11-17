@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 use super::Composition;
-use super::model::{Content, Layer, LayerReference, Shape, TransformComponents};
+use super::model::{Content, Layer, LayerReference, PathCheck, Shape, TransformComponents};
 use super::render::{check_fixed_shapes, count_shapes, evaluate_paths};
 use crate::limits::{Limit, Limits, ShapeCheck, ShapeCost, ShapeError};
 use kurbo::{Affine, PathEl, Point};
@@ -39,7 +39,11 @@ pub enum EvaluationError {
         /// The most that the limit allows.
         maximum: usize,
     },
-    /// A rectangle or ellipse in this layer has a size that is not finite at this frame.
+    /// A shape or a mask of this layer is not finite at this frame: a rectangle or ellipse
+    /// has a size that is not finite, or a path of the layer has a coordinate that is not.
+    ///
+    /// A size is checked for every layer, and a path for the layers that are rendered at
+    /// the frame.
     InvalidShape(OccurrencePath),
 }
 
@@ -201,6 +205,12 @@ impl Composition {
     ///
     /// Fails if the animation asks for more at this frame than the [limits](crate::limits)
     /// allow. What it returns is within them.
+    ///
+    /// Fails with [`EvaluationError::InvalidShape`] if a layer that is rendered at this frame
+    /// has a shape or a mask whose path is not finite: a path of the file itself, before the
+    /// transform of a group, a repeater or a layer is applied to it. No file can write a
+    /// number that is not finite, but a vertex and its tangent can add up to more than a float
+    /// holds, as can an easing that overshoots.
     pub fn evaluate(&self, frame: f64) -> Result<EvaluatedComposition<'_>, EvaluationError> {
         self.evaluate_within(frame, &Limits::DEFAULT)
     }
@@ -230,6 +240,9 @@ impl Composition {
                 limit,
                 maximum: limits.maximum(limit),
             })?;
+        // The paths are checked last, when it is known that the frame is within the limits,
+        // which bound what evaluating the paths of the layers that are rendered takes.
+        check_rendered_paths(&layers, &mut Vec::new())?;
         Ok(EvaluatedComposition {
             composition: self,
             layers,
@@ -249,8 +262,10 @@ impl Composition {
             // may be finite at another frame, so it is left to the evaluation of a frame.
             ShapeError::NonFiniteSize => None,
         };
+        let mut scratch = Vec::new();
         for layer in self.assets.values_mut().flatten().chain(&mut self.layers) {
             let Content::Shape(shapes) = &layer.content else {
+                layer.path_check = path_check(layer, &mut scratch);
                 continue;
             };
             let check = check_fixed_shapes(shapes, limits, 0).and_then(|fixed| {
@@ -265,6 +280,9 @@ impl Composition {
                 Err(None) => ShapeCheck::EveryFrame,
                 Err(Some(error)) => return Err(error),
             };
+            // The shapes are within the limits on a single shape here, which bounds what
+            // evaluating their paths takes.
+            layer.path_check = path_check(layer, &mut scratch);
         }
         let mut structure = Structure {
             animation: self,
@@ -276,6 +294,62 @@ impl Composition {
             .visit_layers(&self.layers, 1)
             .map_err(limit_exceeded)
     }
+}
+
+/// Returns when the paths of a layer have to be checked for coordinates that are not finite.
+fn path_check(layer: &Layer, scratch: &mut Vec<PathEl>) -> PathCheck {
+    if layer.has_fixed_paths() && layer.has_finite_paths(0.0, scratch) {
+        PathCheck::Never
+    } else {
+        PathCheck::EveryFrame
+    }
+}
+
+/// Fails if a layer that is rendered at this frame has a shape or a mask with a path that is
+/// not finite.
+///
+/// The layers that are rendered are those that [`Renderer`](crate::Renderer) draws, or would
+/// draw if they were not transparent: the layers of the composition and of the
+/// precompositions it shows that are within their in and out points and not hidden, and the
+/// track matte sources of those. The limits bound the paths of these layers together, so
+/// evaluating them all once more takes no more than drawing them does.
+///
+/// The paths of other layers can still be queried, and are not checked.
+fn check_rendered_paths(
+    layers: &[EvaluatedLayer<'_>],
+    scratch: &mut Vec<PathEl>,
+) -> Result<(), EvaluationError> {
+    let mut rendered: Vec<_> = layers
+        .iter()
+        .map(|node| node.in_range && !node.layer.hidden && !node.layer.is_matte_source)
+        .collect();
+    // A matte source is rendered for a layer that is rendered. Sources come before the layers
+    // that they matte in this order, so going through it backwards reaches the source of a
+    // source in one pass. A cycle has failed the evaluation before.
+    let matte_order = dependency_order(layers.len(), |index| {
+        layers[index].matte.map(|(_, source)| source)
+    })
+    .unwrap_or_default();
+    for &index in matte_order.iter().rev() {
+        if rendered[index]
+            && let Some((_, source)) = layers[index].matte
+        {
+            rendered[source] = layers[source].in_range;
+        }
+    }
+    for (node, _) in layers
+        .iter()
+        .zip(rendered)
+        .filter(|(_, rendered)| *rendered)
+    {
+        if node.layer.path_check == PathCheck::EveryFrame
+            && !node.layer.has_finite_paths(node.frame, scratch)
+        {
+            return Err(EvaluationError::InvalidShape(node.path.clone()));
+        }
+        check_rendered_paths(&node.children, scratch)?;
+    }
+    Ok(())
 }
 
 /// Returns the index of the layer that mattes a layer, if it is one of `layers`.

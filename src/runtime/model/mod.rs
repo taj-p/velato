@@ -239,6 +239,35 @@ impl Geometry {
         }
     }
 
+    /// Whether [`Self::evaluate`] emits the same path at every frame.
+    pub(crate) fn is_fixed(&self) -> bool {
+        match self {
+            Self::Fixed(_) => true,
+            Self::Rect(value) => value.is_fixed(),
+            Self::Ellipse(value) => value.is_fixed(),
+            // A path without keyframes is imported as `Fixed`.
+            Self::Spline(_) => false,
+            Self::Star(value) => value.is_fixed(),
+        }
+    }
+
+    /// Whether every coordinate of the path that [`Self::evaluate`] emits at this frame is
+    /// finite. `scratch` is a buffer to evaluate into.
+    ///
+    /// A path is not finite if a coordinate of it is not, which a file cannot write, or if
+    /// a sum or product of what it does write is too large for a float: a vertex and its
+    /// tangent, an easing that overshoots by more than any number, or the square of a radius.
+    pub(crate) fn is_finite(&self, frame: f64, scratch: &mut Vec<PathEl>) -> bool {
+        match self {
+            Self::Fixed(value) => path_is_finite(value),
+            _ => {
+                scratch.clear();
+                self.evaluate(frame, scratch);
+                path_is_finite(scratch)
+            }
+        }
+    }
+
     /// Whether [`Self::max_elements`] returns the same at every frame.
     pub(crate) fn has_fixed_size(&self) -> bool {
         match self {
@@ -269,6 +298,16 @@ impl Geometry {
             }
         }
     }
+}
+
+/// Whether every coordinate of a path is finite.
+pub(crate) fn path_is_finite(elements: &[PathEl]) -> bool {
+    elements.iter().all(|element| match element {
+        PathEl::MoveTo(p) | PathEl::LineTo(p) => p.is_finite(),
+        PathEl::QuadTo(p1, p2) => p1.is_finite() && p2.is_finite(),
+        PathEl::CurveTo(p1, p2, p3) => p1.is_finite() && p2.is_finite() && p3.is_finite(),
+        PathEl::ClosePath => true,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -489,6 +528,69 @@ pub struct Layer {
     /// that is made in another way has its shapes counted each time the composition is
     /// evaluated.
     pub(crate) shape_check: ShapeCheck,
+    /// When the paths of the shapes and masks of the layer have to be checked for coordinates
+    /// that are not finite. Like `shape_check`, this is a record that import makes.
+    pub(crate) path_check: PathCheck,
+}
+
+/// When the paths of the shapes and masks of a layer have to be checked for coordinates that
+/// are not finite.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum PathCheck {
+    /// Each time the layer is rendered, because a path of it is animated, a path that is not
+    /// animated is not finite, or nothing is known about them.
+    #[default]
+    EveryFrame,
+    /// Never: import found that every path is the same at every frame, and finite.
+    Never,
+}
+
+impl Layer {
+    /// Whether no shape and no mask of the layer has a path that is not finite at this frame.
+    pub(crate) fn has_finite_paths(&self, frame: f64, scratch: &mut Vec<PathEl>) -> bool {
+        fn finite(shapes: &[Shape], frame: f64, scratch: &mut Vec<PathEl>) -> bool {
+            shapes.iter().all(|shape| {
+                let shape = match shape {
+                    Shape::Hidden(shape) => shape.as_ref(),
+                    shape => shape,
+                };
+                match shape {
+                    Shape::Group(shapes, _) => finite(shapes, frame, scratch),
+                    Shape::Geometry(geometry) => geometry.is_finite(frame, scratch),
+                    _ => true,
+                }
+            })
+        }
+        self.masks
+            .iter()
+            .all(|mask| mask.geometry.is_finite(frame, scratch))
+            && match &self.content {
+                Content::Shape(shapes) => finite(shapes, frame, scratch),
+                _ => true,
+            }
+    }
+
+    /// Whether every shape and every mask of the layer has the same path at every frame.
+    pub(crate) fn has_fixed_paths(&self) -> bool {
+        fn fixed(shapes: &[Shape]) -> bool {
+            shapes.iter().all(|shape| {
+                let shape = match shape {
+                    Shape::Hidden(shape) => shape.as_ref(),
+                    shape => shape,
+                };
+                match shape {
+                    Shape::Group(shapes, _) => fixed(shapes),
+                    Shape::Geometry(geometry) => geometry.is_fixed(),
+                    _ => true,
+                }
+            })
+        }
+        self.masks.iter().all(|mask| mask.geometry.is_fixed())
+            && match &self.content {
+                Content::Shape(shapes) => fixed(shapes),
+                _ => true,
+            }
+    }
 }
 
 /// Matte layer mode.

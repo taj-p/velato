@@ -3,7 +3,7 @@
 
 use super::model::{
     Content, Draw, Geometry, GroupTransform, ImageAsset, Layer, Repeater, RepeaterComposite, Shape,
-    fixed,
+    fixed, path_is_finite,
 };
 use super::trim::Measured;
 use super::{
@@ -16,6 +16,9 @@ use peniko::{Fill, Mix};
 use std::collections::HashMap;
 use std::ops::Range;
 
+/// Receives the draw calls of a [`Renderer`].
+///
+/// Every path, clip shape and transform that a sink is handed is finite.
 pub trait RenderSink {
     /// Begins a layer that is composited onto what is below it, with `blend` and `alpha`, when it
     /// is popped. Content drawn into the layer is clipped to `shape`, and blends only with other
@@ -65,7 +68,10 @@ pub struct Renderer {
     batch: Batch,
     /// Batches to reuse while the shapes of one layer are held for another layer to render.
     spare_batches: Vec<Batch>,
+    /// The paths of the masks of the layers that are being rendered, one after another.
     mask_elements: Vec<PathEl>,
+    /// Where each of those paths ends in `mask_elements`.
+    mask_ends: Vec<usize>,
     /// Whether layers that were asked make a draw call, by the address of their evaluation.
     /// Asking evaluates the shapes of a layer, so each layer is asked once per frame.
     layer_draws: HashMap<usize, bool>,
@@ -100,7 +106,14 @@ impl Renderer {
     /// Renders a frame, leaving the sink unchanged if evaluation fails.
     ///
     /// Evaluation fails for an animation that asks for more at this frame than the
-    /// [limits](crate::limits) allow.
+    /// [limits](crate::limits) allow, and for one in which a shape or a mask that would be
+    /// drawn has a path that is not finite, as [`Composition::evaluate`] describes.
+    ///
+    /// The sink is never handed a path, a clip or a transform with a coordinate that is not
+    /// finite. What is finite in the animation, and is not once the transforms of its
+    /// groups, repeaters and layers and the `transform` passed here are applied to it, is
+    /// left out: a fill or stroke whose path overflows is not drawn, nor is a layer whose
+    /// transform does, and nothing is drawn with a `transform` that is not finite.
     pub fn try_append(
         &mut self,
         animation: &Composition,
@@ -117,6 +130,8 @@ impl Renderer {
     /// Draws a saved evaluation without recalculating layer hierarchy, timing or transforms.
     ///
     /// Shape and paint properties are still sampled during drawing.
+    ///
+    /// Like [`Self::try_append`], this hands the sink nothing that is not finite.
     ///
     /// NOTE: this is not a frame cache.
     pub fn append_evaluated(
@@ -135,6 +150,11 @@ impl Renderer {
         }
         let clip = Rect::new(0.0, 0.0, animation.width as _, animation.height as _);
         let clip_bounds = transform.transform_rect_bbox(clip);
+        // Nothing can be drawn with a transform that is not finite, or that takes the
+        // bounds of the animation out of the range of floats.
+        if !transform.is_finite() || !clip_bounds.is_finite() {
+            return;
+        }
         // The caller's opacity applies to the animation as a whole, so layers that may overlap
         // are composited first, and layers with a blend mode blend with the animation only.
         // That layer also serves as the composition clip.
@@ -187,9 +207,30 @@ impl Renderer {
         }
         let layer = evaluated.layer;
         let frame = evaluated.frame;
-        scene.begin_layer_group(&layer.name, layer_index);
         let parent_transform = output_transform;
         let transform = output_transform * evaluated.full_transform;
+        // The transform of a layer is finite, but with a large enough output transform
+        // their product is not. Such a layer has nothing that can be drawn.
+        if !transform.is_finite() {
+            return;
+        }
+        // The masks are evaluated before anything is pushed for the layer, because a mask
+        // that is not finite cannot be handed to the sink, and without it the layer cannot be
+        // drawn. Evaluating a composition fails for such a mask, so this only holds off what
+        // was not evaluated. A layer that is rendered meanwhile, as a matte source, adds its
+        // masks after these and removes them again.
+        let masks_start = self.mask_elements.len();
+        let ends_start = self.mask_ends.len();
+        for mask in &layer.masks {
+            mask.geometry.evaluate(frame, &mut self.mask_elements);
+            self.mask_ends.push(self.mask_elements.len());
+        }
+        if !path_is_finite(&self.mask_elements[masks_start..]) {
+            self.mask_elements.truncate(masks_start);
+            self.mask_ends.truncate(ends_start);
+            return;
+        }
+        scene.begin_layer_group(&layer.name, layer_index);
         let full_rect = Rect::new(0.0, 0.0, animation.width as f64, animation.height as f64);
         // Shapes are evaluated before anything is pushed, so that the number of draw calls is
         // known.
@@ -279,11 +320,13 @@ impl Renderer {
                 FilterLayerResult::Unsupported => {}
             }
         }
-        for mask in &layer.masks {
-            mask.geometry.evaluate(frame, &mut self.mask_elements);
-            scene.push_clip_layer(transform, &self.mask_elements.as_slice());
-            self.mask_elements.clear();
+        let mut mask_start = masks_start;
+        for mask_end in &self.mask_ends[ends_start..] {
+            scene.push_clip_layer(transform, &&self.mask_elements[mask_start..*mask_end]);
+            mask_start = *mask_end;
         }
+        self.mask_elements.truncate(masks_start);
+        self.mask_ends.truncate(ends_start);
         match &layer.content {
             Content::None => {}
             Content::Instance { .. } => {
@@ -309,7 +352,7 @@ impl Renderer {
                     let bounds = image
                         .width
                         .zip(image.height)
-                        .filter(|(w, h)| *w > 0.0 && *h > 0.0);
+                        .filter(|(w, h)| *w > 0.0 && *h > 0.0 && w.is_finite() && h.is_finite());
                     if let Some((width, height)) = bounds {
                         scene.push_clip_layer(transform, &Rect::new(0.0, 0.0, width, height));
                     }
@@ -399,6 +442,11 @@ impl Renderer {
 /// the clip layer for the common precomposition that fills the composition.
 fn precomposition_clip(layer: &Layer, transform: Affine, clip_bounds: &Rect) -> Option<Rect> {
     let bounds = Rect::new(0.0, 0.0, layer.width.max(0.0), layer.height.max(0.0));
+    // A precomposition without bounds, which only one that is made in code can be, shows
+    // everything.
+    if !bounds.is_finite() {
+        return None;
+    }
     let to_layer = transform.inverse();
     let covered = to_layer.is_finite() && {
         // Tolerates rounding in the transform when the edges coincide.
@@ -1121,7 +1169,9 @@ impl Batch {
             }
             path.as_slice()
         };
-        if !path.is_empty() {
+        // The paths of a layer that was evaluated are finite. Brought into the space of this
+        // style by the transform of another group or of a repeater copy, a path may not be.
+        if !path.is_empty() && path_is_finite(path) {
             scene.draw(
                 paint.stroke.as_ref(),
                 draw.fill_rule,
@@ -3426,6 +3476,132 @@ mod tests {
         assert_eq!(rules, [(true, Fill::NonZero), (true, Fill::NonZero)]);
     }
 
+    /// Renders a frame and returns the error, having checked that the sink was left
+    /// untouched and that evaluating the frame fails the same way.
+    fn invalid(composition: &crate::Composition, frame: f64) -> crate::EvaluationError {
+        let mut sink = RecordingSink::default();
+        let error = crate::Renderer::new()
+            .try_append(composition, frame, Affine::IDENTITY, 1.0, &mut sink)
+            .expect_err("rendering should have failed");
+        assert!(sink.events.is_empty(), "{:?}", sink.events);
+        assert_eq!(composition.evaluate(frame).unwrap_err(), error);
+        error
+    }
+
+    fn invalid_shape(indices: &[usize]) -> crate::EvaluationError {
+        crate::EvaluationError::InvalidShape(crate::OccurrencePath(indices.to_vec()))
+    }
+
+    /// Easing handles that overshoot by more than a float can hold.
+    fn overshooting() -> serde_json::Value {
+        json!({ "o": { "x": [0.3], "y": [1e308] }, "i": { "x": [0.7], "y": [1e308] } })
+    }
+
+    /// A closed path whose vertices and tangents add up to more than a float can hold.
+    fn overflowing_path() -> serde_json::Value {
+        json!({
+            "ty": "sh",
+            "ks": { "a": 0, "k": {
+                "c": true,
+                "v": [[1.7e308, 0], [0, 1.7e308], [-1.7e308, 0]],
+                "i": [[1.7e308, 0], [0, 1.7e308], [-1.7e308, 0]],
+                "o": [[1.7e308, 1.7e308], [1.7e308, 1.7e308], [-1.7e308, -1.7e308]],
+            } },
+        })
+    }
+
+    #[test]
+    fn eased_path_that_is_not_finite_is_an_error_at_the_frame() {
+        let animated = |easing: serde_json::Value| {
+            let path = json!({ "ty": "sh", "ks": growing_square(easing) });
+            composition(json!([shape_layer(1, json!([path, fill(100.0)]))]))
+        };
+        // The share of the way that the path has gone overflows, and every coordinate of the
+        // path with it.
+        let composition = animated(overshooting());
+        for frame in [1.0, 20.0, 39.0] {
+            assert_eq!(invalid(&composition, frame), invalid_shape(&[0]));
+        }
+        // The path is finite at its keyframes, and with an overshoot that a float can hold.
+        for frame in [0.0, 40.0, 50.0] {
+            assert_eq!(trace(&composition, frame), ["clip", "fill(1)", "pop"]);
+        }
+        let large = json!({ "o": { "x": [0.3], "y": [1e30] }, "i": { "x": [0.7], "y": [1e30] } });
+        assert_eq!(trace(&animated(large), 20.0), ["clip", "fill(1)", "pop"]);
+    }
+
+    #[test]
+    fn eased_mask_that_is_not_finite_is_an_error_at_the_frame() {
+        let mask = json!({
+            "mode": "a",
+            "pt": growing_square(overshooting()),
+            "o": { "a": 0, "k": 100 },
+        });
+        let masked = |layer: serde_json::Value| {
+            composition_with_assets(
+                json!([precomp(
+                    "comp",
+                    json!([solid_layer(1, 10.0, 10.0, "#ff0000")])
+                )]),
+                json!([with(layer, json!({ "masksProperties": [mask.clone()] }))]),
+            )
+        };
+        // A mask clips a layer of any kind.
+        for layer in [
+            shape_layer(1, json!([rect(0.0, 0.0, 100.0, 100.0), fill(100.0)])),
+            solid_layer(1, 100.0, 100.0, "#00ff00"),
+            precomp_layer(1, "comp"),
+        ] {
+            let composition = masked(layer);
+            assert_eq!(invalid(&composition, 20.0), invalid_shape(&[0]));
+            let clips = trace(&composition, 0.0)
+                .iter()
+                .filter(|call| *call == "clip")
+                .count();
+            assert!(clips >= 2, "the composition and the mask");
+        }
+    }
+
+    #[test]
+    fn path_that_overflows_is_an_error_at_every_frame() {
+        let star = json!({
+            "ty": "sr",
+            "sy": 1,
+            "p": { "a": 0, "k": [-1.7e308, 0] },
+            "or": { "a": 0, "k": 1e308 },
+            "os": { "a": 0, "k": 50 },
+            "ir": { "a": 0, "k": 5e307 },
+            "is": { "a": 0, "k": 50 },
+            "r": { "a": 0, "k": 0 },
+            "pt": { "a": 0, "k": 5 },
+        });
+        // The far side of each of these lies beyond the largest float.
+        let ellipse = json!({
+            "ty": "el",
+            "p": { "a": 0, "k": [1.7e308, 0] },
+            "s": { "a": 0, "k": [1e308, 1e308] },
+        });
+        let rectangle = json!({
+            "ty": "rc",
+            "p": { "a": 0, "k": [0, -1.7e308] },
+            "s": { "a": 0, "k": [10, 1e308] },
+            "r": { "a": 0, "k": 0 },
+        });
+        for shape in [overflowing_path(), star, ellipse, rectangle] {
+            let shapes = json!([shape.clone(), fill(100.0)]);
+            let composition = composition(json!([shape_layer(1, shapes)]));
+            for frame in [0.0, 30.0] {
+                assert!(composition.evaluate(frame).is_err(), "{shape}");
+                assert_eq!(invalid(&composition, frame), invalid_shape(&[0]), "{shape}");
+            }
+            // Geometry that no style draws, or that is hidden, is a path of the layer too.
+            let hidden = with(shape.clone(), json!({ "hd": true }));
+            let unused = group(vec![hidden], 100.0);
+            let composition = self::composition(json!([shape_layer(1, json!([unused]))]));
+            assert_eq!(invalid(&composition, 0.0), invalid_shape(&[0]), "{shape}");
+        }
+    }
+
     #[test]
     fn ellipse_of_any_finite_size_has_a_finite_path() {
         // The radii of all but the first are beyond what their fourth power is finite for.
@@ -3483,5 +3659,196 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn paths_are_checked_for_the_layers_that_are_rendered() {
+        let bad = |ind: u32| shape_layer(ind, json!([overflowing_path(), fill(100.0)]));
+        let good = |ind: u32| shape_layer(ind, json!([rect(0.0, 0.0, 9.0, 9.0), fill(100.0)]));
+        let renders = |layers: serde_json::Value, frame: f64| {
+            let composition =
+                composition_with_assets(json!([precomp("bad", json!([good(1), bad(2)]))]), layers);
+            let evaluated = composition.evaluate(frame);
+            if evaluated.is_ok() {
+                render(&composition, frame, 1.0);
+            } else {
+                invalid(&composition, frame);
+            }
+            evaluated.map(|_| ()).map_err(|error| match error {
+                crate::EvaluationError::InvalidShape(path) => path.0,
+                error => panic!("{error}"),
+            })
+        };
+        // A layer that is transparent is rendered as far as its paths go.
+        assert_eq!(
+            renders(json!([with(bad(1), opacity(0.0))]), 0.0),
+            Err(vec![0])
+        );
+        // A hidden layer and a layer outside its range are not.
+        assert_eq!(
+            renders(json!([with(bad(1), json!({ "hd": true }))]), 0.0),
+            Ok(())
+        );
+        let late = json!([good(1), with(bad(2), json!({ "ip": 30 }))]);
+        assert_eq!(renders(late.clone(), 29.0), Ok(()));
+        assert_eq!(renders(late, 30.0), Err(vec![1]));
+        // A matte source is rendered for the layer that it mattes, hidden or not, unless
+        // that layer is not rendered.
+        let matte = |source: serde_json::Value, matted: serde_json::Value| {
+            json!([
+                with(source, json!({ "td": 1 })),
+                with(matted, json!({ "tt": 1 })),
+            ])
+        };
+        assert_eq!(renders(matte(bad(1), good(2)), 0.0), Err(vec![0]));
+        let hidden_source = with(bad(1), json!({ "hd": true }));
+        assert_eq!(renders(matte(hidden_source, good(2)), 0.0), Err(vec![0]));
+        let hidden_matted = with(good(2), json!({ "hd": true }));
+        assert_eq!(renders(matte(bad(1), hidden_matted), 0.0), Ok(()));
+        // The layers of a precomposition are rendered where a layer that shows it is.
+        assert_eq!(
+            renders(json!([precomp_layer(1, "bad")]), 0.0),
+            Err(vec![0, 1])
+        );
+        let hidden = with(precomp_layer(1, "bad"), json!({ "hd": true }));
+        assert_eq!(renders(json!([hidden]), 0.0), Ok(()));
+        let late = with(precomp_layer(1, "bad"), json!({ "ip": 10 }));
+        assert_eq!(renders(json!([late.clone()]), 9.0), Ok(()));
+        assert_eq!(renders(json!([late]), 10.0), Err(vec![0, 1]));
+        let source = matte(precomp_layer(1, "bad"), good(2));
+        assert_eq!(renders(source, 0.0), Err(vec![0, 1]));
+    }
+
+    #[test]
+    fn path_checks_follow_what_is_animated() {
+        use crate::runtime::model::{Layer, PathCheck};
+        let check = |layer: serde_json::Value| composition(json!([layer])).layers[0].path_check;
+        let fixed_shapes = json!([
+            rect(0.0, 0.0, 10.0, 10.0),
+            group(
+                vec![
+                    json!({ "ty": "sh", "ks": { "a": 0, "k": growing_square(json!({}))["k"][0]["s"][0] } })
+                ],
+                100.0
+            ),
+            fill(100.0),
+            repeater(3, 5.0, 100.0, 50.0),
+        ]);
+        assert_eq!(
+            check(shape_layer(1, fixed_shapes.clone())),
+            PathCheck::Never
+        );
+        assert_eq!(check(layer(3, 1)), PathCheck::Never);
+        assert_eq!(
+            check(solid_layer(1, 10.0, 10.0, "#ff0000")),
+            PathCheck::Never
+        );
+        // A path that moves may not be finite at some frame.
+        let animated = json!({ "ty": "sh", "ks": growing_square(json!({})) });
+        let every_frame = |layer| assert_eq!(check(layer), PathCheck::EveryFrame);
+        every_frame(shape_layer(1, json!([animated, fill(100.0)])));
+        let moving = with(
+            rect(0.0, 0.0, 10.0, 10.0),
+            json!({ "p": { "a": 1, "k": [{ "t": 0, "s": [0, 0] }, { "t": 60, "s": [50, 50] }] } }),
+        );
+        every_frame(shape_layer(1, json!([group(vec![moving], 100.0)])));
+        let mask =
+            json!({ "mode": "a", "pt": growing_square(json!({})), "o": { "a": 0, "k": 100 } });
+        every_frame(with(layer(3, 1), json!({ "masksProperties": [mask] })));
+        // One that does not move and is not finite fails at every frame.
+        every_frame(shape_layer(1, json!([overflowing_path()])));
+        // Nothing is known about a layer that was not imported.
+        assert_eq!(Layer::default().path_check, PathCheck::EveryFrame);
+    }
+
+    #[test]
+    fn sink_is_handed_nothing_that_is_not_finite() {
+        // A path that is finite where it is, in a group that scales it beyond the largest
+        // float. The stroke inside the group draws the path as it is, with the transform of
+        // the group. The fill after the group takes the path into its own space, where it is
+        // not finite, and is left out.
+        let far = json!({ "ty": "sh", "ks": { "a": 0, "k": {
+            "c": false,
+            "v": [[1e200, 0], [0, 1e200]],
+            "i": [[0, 0], [0, 0]],
+            "o": [[0, 0], [0, 0]],
+        } } });
+        let scaled = |items: Vec<serde_json::Value>| {
+            let mut group = group(items, 100.0);
+            let last = group["it"].as_array().unwrap().len() - 1;
+            group["it"][last]["s"] = json!({ "a": 0, "k": [1e200, 1e200] });
+            group
+        };
+        let shapes = json!([scaled(vec![far, stroke(100.0)]), fill(100.0)]);
+        let layer = shape_layer(1, shapes);
+        let composition = self::composition(json!([
+            layer.clone(),
+            solid_layer(2, 50.0, 50.0, "#00ff00")
+        ]));
+        assert_eq!(
+            trace(&composition, 0.0),
+            ["clip", "fill(1)", "stroke(1)", "pop"]
+        );
+
+        // With an output transform that takes the transform of a layer beyond the largest
+        // float, the layer is left out, with its masks and layers.
+        let grown = with(
+            transform(100.0),
+            json!({ "s": { "a": 0, "k": [1e200, 1e200] } }),
+        );
+        let mask =
+            json!({ "mode": "a", "pt": growing_square(json!({})), "o": { "a": 0, "k": 100 } });
+        let large = with(
+            solid_layer(1, 50.0, 50.0, "#ff0000"),
+            json!({ "ks": grown, "masksProperties": [mask], "bm": 1 }),
+        );
+        let composition = self::composition(json!([large, solid_layer(2, 50.0, 50.0, "#00ff00")]));
+        let calls = |transform: Affine| -> Vec<String> {
+            render_with(&composition, 0.0, transform, 0.5)
+                .iter()
+                .filter(|event| !matches!(event, Event::BeginLayer(_) | Event::EndLayer))
+                .map(Event::to_string)
+                .collect()
+        };
+        assert_eq!(calls(Affine::IDENTITY).len(), 8);
+        assert_eq!(
+            calls(Affine::scale(1e200)),
+            ["layer(0.5)", "fill(1)", "pop"]
+        );
+        // Nothing at all is drawn with an output transform that is not finite, or that takes
+        // the bounds of the animation beyond the largest float.
+        for transform in [
+            Affine::scale(f64::NAN),
+            Affine::translate((f64::INFINITY, 0.0)),
+            Affine::scale(1e307),
+        ] {
+            assert_eq!(calls(transform), [""; 0], "{transform:?}");
+        }
+    }
+
+    #[test]
+    fn layer_with_a_mask_that_is_not_finite_is_not_drawn() {
+        use crate::runtime::model::Geometry;
+        let mask = json!({ "mode": "a", "pt": growing_square(json!({}))["k"][0]["s"][0], "o": { "a": 0, "k": 100 } });
+        let mask =
+            json!({ "mode": mask["mode"], "pt": { "a": 0, "k": mask["pt"] }, "o": mask["o"] });
+        let masked = with(
+            shape_layer(1, json!([rect(0.0, 0.0, 100.0, 100.0), fill(100.0)])),
+            json!({ "masksProperties": [mask.clone(), mask] }),
+        );
+        let below = solid_layer(2, 50.0, 50.0, "#00ff00");
+        let mut composition = composition(json!([masked, below]));
+        assert_eq!(
+            trace(&composition, 0.0),
+            [
+                "clip", "fill(1)", "clip", "clip", "fill(1)", "pop", "pop", "pop"
+            ]
+        );
+        // Replacing a mask of an imported layer leaves the record that import made of its
+        // paths as it was, so evaluating does not look at the mask. The renderer does.
+        let nowhere = kurbo::PathEl::MoveTo((f64::NAN, 0.0).into());
+        composition.layers[0].masks[1].geometry = Geometry::Fixed(vec![nowhere]);
+        assert!(composition.evaluate(0.0).is_ok());
+        assert_eq!(trace(&composition, 0.0), ["clip", "fill(1)", "pop"]);
     }
 }
