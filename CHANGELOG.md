@@ -32,6 +32,8 @@ This release has an [MSRV][] of 1.88.
 - Position keyframes now retain spatial tangents (`ti`, `to`) and follow curved motion paths using temporally eased arc length. ([#120][] by [@RobertBrewitz])
 - Renamed `Layer::mask_layer` to `matte` and `Layer::is_mask` to `is_matte_source` to distinguish track mattes from path masks in accordance with lottie spec layers docs. ([#125][] by [@RobertBrewitz][])
 - Parent and matte references now use `LayerReference`. ([#125][] by [@RobertBrewitz][])
+- Layers with zero opacity are skipped, along with their `begin_layer_group` and `end_layer_group` calls, and rendering with an `alpha` of zero emits nothing.
+- When the `alpha` passed to the renderer needs compositing, the composition clip is pushed with `RenderSink::push_layer` instead of `push_clip_layer`.
 
 ### Fixed
 
@@ -41,6 +43,7 @@ This release has an [MSRV][] of 1.88.
 - Fixed reversed transform skew direction for nonzero `sk` values. ([#119][] by [@RobertBrewitz])
 - Reject invalid animation frame rates duriing import ([#121][] by [@RobertBrewitz][])
 - Fixed omitted layer rotation causing panick during import. ([#122][] by [@RobertBrewitz][])
+- Opacity now applies to a layer, precomposition, shape group or repeater copy as a whole, and the `alpha` passed to the renderer to the whole animation. Content with more than one draw call is rendered into a layer first, so overlapping shapes no longer show through each other; a single draw call still takes the opacity in its brush.
 - Keyframes without a start value (`s`) now import. Older exporters end each animated property with a keyframe that holds only a time; it takes the previous keyframe's end value (`e`).
 
 ## [0.12.0][] (2026-09-09)

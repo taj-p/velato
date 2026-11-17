@@ -14,6 +14,8 @@ use std::mem::swap;
 use std::ops::Range;
 
 pub trait RenderSink {
+    /// Begins a layer that is composited onto what is below it, with `blend` and `alpha`, when it
+    /// is popped. Content drawn into the layer is clipped to `shape`.
     fn push_layer(
         &mut self,
         blend: impl Into<peniko::BlendMode>,
@@ -110,9 +112,21 @@ impl Renderer {
     ) {
         let animation = evaluated.composition;
         self.batch.clear();
+        let alpha = unit_alpha(alpha);
+        if alpha <= 0.0 {
+            return;
+        }
         let clip = Rect::new(0.0, 0.0, animation.width as _, animation.height as _);
         let clip_bounds = transform.transform_rect_bbox(clip);
-        scene.push_clip_layer(transform, &clip);
+        // The caller's opacity applies to the animation as a whole, so layers that may overlap
+        // are composited first. That layer also serves as the composition clip.
+        let isolate_opacity = alpha != 1.0 && drawing_layers(&evaluated.layers) > 1;
+        if isolate_opacity {
+            scene.push_layer(Mix::Normal, alpha as f32, transform, &clip);
+        } else {
+            scene.push_clip_layer(transform, &clip);
+        }
+        let alpha = if isolate_opacity { 1.0 } else { alpha };
         for (layer_index, layer) in evaluated.layers.iter().enumerate().rev() {
             if !layer.visible {
                 continue;
@@ -131,6 +145,8 @@ impl Renderer {
         scene.pop_layer();
     }
 
+    /// Renders one layer. `alpha` is opacity that the caller or an enclosing precomposition left
+    /// for this layer to apply, because the layer is the only one that draws inside it.
     #[expect(clippy::too_many_arguments, reason = "Deferred")]
     fn render_layer(
         &mut self,
@@ -146,6 +162,10 @@ impl Renderer {
         if !evaluated.in_range {
             return;
         }
+        let mut alpha = alpha * unit_alpha(evaluated.opacity);
+        if alpha <= 0.0 {
+            return;
+        }
         let layer = evaluated.layer;
         let frame = evaluated.frame;
         scene.begin_layer_group(&layer.name, layer_index);
@@ -153,23 +173,39 @@ impl Renderer {
         let transform = output_transform * evaluated.full_transform;
         let full_rect = Rect::new(0.0, 0.0, animation.width as f64, animation.height as f64);
         if let Some((mode, mask_index)) = evaluated.matte {
-            scene.push_layer(Mix::Normal, 1.0, parent_transform, &full_rect);
+            // The matte is applied inside a layer of its own, which can carry the opacity of
+            // the matted layer as well.
+            scene.push_layer(Mix::Normal, alpha as f32, parent_transform, &full_rect);
+            alpha = 1.0;
+            // The matte source is not content of this layer, so it does not take its opacity.
             self.render_layer(
                 animation,
                 layer_set,
                 &layer_set[mask_index],
                 mask_index,
                 output_transform,
-                alpha,
+                1.0,
                 clip_bounds,
                 scene,
             );
             scene.push_layer(mode, 1.0, parent_transform, &full_rect);
         }
-        let alpha = alpha * evaluated.opacity;
 
-        // NOTE: important for isolating opacity so it applies to the layer effect output.
-        let isolate_opacity = !layer.effects.is_empty() && alpha != 1.0;
+        let draw_calls = match &layer.content {
+            Content::None => 0,
+            Content::Instance { .. } => drawing_layers(&evaluated.children),
+            Content::Image { asset_id } => usize::from(animation.images.contains_key(asset_id)),
+            Content::Shape(shapes) => {
+                self.batch.evaluate(shapes, transform, frame);
+                self.batch.draw_calls()
+            }
+        };
+
+        // Opacity applies to the layer as a whole and to the output of its effects, so content
+        // that may overlap itself is composited first. A single draw call gives the same result
+        // with the opacity in its brush, and a precomposition with a single drawing layer by
+        // handing the opacity to that layer; neither needs a layer.
+        let isolate_opacity = alpha != 1.0 && (!layer.effects.is_empty() || draw_calls > 1);
 
         if isolate_opacity {
             scene.push_layer(Mix::Normal, alpha as f32, parent_transform, &full_rect);
@@ -229,9 +265,8 @@ impl Renderer {
                     }
                 }
             }
-            Content::Shape(shapes) => {
-                self.batch.evaluate(shapes, transform, alpha, frame, true);
-                self.batch.render(scene, clip_bounds);
+            Content::Shape(_) => {
+                self.batch.render(scene, clip_bounds, alpha);
                 self.batch.clear();
             }
         }
@@ -242,30 +277,60 @@ impl Renderer {
     }
 }
 
+/// Limits an opacity to the range it can be composited with. `NaN` counts as transparent.
+fn unit_alpha(alpha: f64) -> f64 {
+    if alpha.is_nan() {
+        0.0
+    } else {
+        alpha.clamp(0.0, 1.0)
+    }
+}
+
+/// Counts the layers that may draw at this frame. Opacity shared by more than one of them has to
+/// be composited for all of them together.
+fn drawing_layers(layers: &[EvaluatedLayer<'_>]) -> usize {
+    layers
+        .iter()
+        .filter(|evaluated| {
+            let layer = evaluated.layer;
+            evaluated.in_range
+                && !layer.hidden
+                && !layer.is_matte_source
+                && evaluated.opacity > 0.0
+                && !matches!(layer.content, Content::None)
+        })
+        .count()
+}
+
 #[derive(Clone, Debug)]
 struct DrawData {
     stroke: Option<fixed::Stroke>,
     brush: fixed::Brush,
+    /// Opacity of the style itself.
     alpha: f64,
     transform: Affine,
     /// Range into `ShapeBatch::geometries`
     geometry: Range<usize>,
     // Only repeaters that copied this style may share its opacity layers with other styles.
     repeater_depth: usize,
+    /// Translucent groups that hold this style and repeater copies that include it, outermost
+    /// first. The opacity of each applies to everything inside it at once.
+    scopes: Vec<OpacityScope>,
 }
 
 impl DrawData {
-    fn new(draw: &Draw, alpha: f64, geometry: Range<usize>, frame: f64) -> Self {
+    fn new(draw: &Draw, geometry: Range<usize>, frame: f64) -> Self {
         Self {
             stroke: draw
                 .stroke
                 .as_ref()
                 .map(|stroke| stroke.evaluate(frame).into_owned()),
             brush: draw.brush.evaluate(1.0, frame).into_owned(),
-            alpha: alpha * draw.opacity.evaluate(frame) / 100.0,
+            alpha: unit_alpha(draw.opacity.evaluate(frame) / 100.0),
             transform: Affine::IDENTITY,
             geometry,
             repeater_depth: 0,
+            scopes: Vec::new(),
         }
     }
 }
@@ -278,11 +343,11 @@ struct GeometryData {
     // Sequential trimming follows copy indices independently of paint stacking.
     trim_order: usize,
     // Inherited styles need copy opacity without inheriting the repeated styles' stacking position.
-    copies: Vec<CopyLayer>,
+    copies: Vec<OpacityScope>,
 }
 
 impl GeometryData {
-    fn opacity_copies(&self) -> &[CopyLayer] {
+    fn opacity_copies(&self) -> &[OpacityScope] {
         // Opaque ancestors still distinguish separate instances of translucent descendants.
         let end = self
             .copies
@@ -293,10 +358,21 @@ impl GeometryData {
     }
 }
 
+/// A shape group or repeater copy whose opacity applies to its content as a whole.
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct CopyLayer {
+struct OpacityScope {
     id: usize,
     alpha: f64,
+}
+
+/// One call to [`RenderSink::draw`]: a style and a run of its geometry in the same repeater
+/// copies.
+#[derive(Clone, Debug)]
+struct DrawCall {
+    /// Index into `Batch::draws`
+    draw: usize,
+    /// Range into `Batch::geometries`
+    geometries: Range<usize>,
 }
 
 #[derive(Debug, Default)]
@@ -304,9 +380,11 @@ struct Batch {
     elements: Vec<PathEl>,
     geometries: Vec<GeometryData>,
     draws: Vec<DrawData>,
+    /// Draw calls in paint order.
+    calls: Vec<DrawCall>,
     repeat_geometries: Vec<GeometryData>,
     repeat_draws: Vec<DrawData>,
-    next_copy: usize,
+    next_scope: usize,
     trim_elements: Vec<PathEl>,
 }
 
@@ -316,7 +394,7 @@ pub(crate) fn evaluate_paths(
     frame: f64,
 ) -> Vec<kurbo::BezPath> {
     let mut batch = Batch::default();
-    batch.evaluate(shapes, transform, 1.0, frame, false);
+    batch.evaluate_shapes(shapes, transform, frame, false);
     batch
         .geometries
         .iter()
@@ -331,11 +409,16 @@ pub(crate) fn evaluate_paths(
 }
 
 impl Batch {
-    fn evaluate(
+    /// Evaluates the shapes of a layer and works out the draw calls they need.
+    fn evaluate(&mut self, shapes: &[Shape], transform: Affine, frame: f64) {
+        self.evaluate_shapes(shapes, transform, frame, true);
+        self.collect_calls();
+    }
+
+    fn evaluate_shapes(
         &mut self,
         shapes: &[Shape],
         transform: Affine,
-        alpha: f64,
         frame: f64,
         collect_draws: bool,
     ) {
@@ -349,7 +432,7 @@ impl Batch {
                             (
                                 transform.evaluate(frame).into_owned(),
                                 if collect_draws {
-                                    opacity.evaluate(frame) / 100.0
+                                    unit_alpha(opacity.evaluate(frame) / 100.0)
                                 } else {
                                     1.0
                                 },
@@ -357,20 +440,25 @@ impl Batch {
                         } else {
                             (Affine::IDENTITY, 1.0)
                         };
-                    self.evaluate(
-                        shapes,
-                        group_transform,
-                        alpha * group_alpha,
-                        frame,
-                        collect_draws,
-                    );
+                    let group_draws = self.draws.len();
+                    self.evaluate_shapes(shapes, group_transform, frame, collect_draws);
+                    if group_alpha != 1.0 {
+                        let scope = OpacityScope {
+                            id: self.next_scope,
+                            alpha: group_alpha,
+                        };
+                        self.next_scope += 1;
+                        for draw in &mut self.draws[group_draws..] {
+                            draw.scopes.insert(0, scope);
+                        }
+                    }
                 }
                 Shape::Geometry(geometry) => {
                     self.push_geometry(geometry, Affine::IDENTITY, frame);
                 }
                 Shape::Draw(draw) => {
                     if collect_draws {
-                        self.push_draw(draw, alpha, geometry_start, frame);
+                        self.push_draw(draw, geometry_start, frame);
                     }
                 }
                 Shape::Repeater(repeater) => {
@@ -403,10 +491,9 @@ impl Batch {
         });
     }
 
-    fn push_draw(&mut self, draw: &Draw, alpha: f64, geometry_start: usize, frame: f64) {
+    fn push_draw(&mut self, draw: &Draw, geometry_start: usize, frame: f64) {
         self.draws.push(DrawData::new(
             draw,
-            alpha,
             geometry_start..self.geometries.len(),
             frame,
         ));
@@ -435,6 +522,12 @@ impl Batch {
         } else {
             0.0
         };
+        let first_scope = self.next_scope;
+        self.next_scope = first_scope.wrapping_add(repeater.copies);
+        let copy_scope = |copy: usize, i: usize| OpacityScope {
+            id: first_scope.wrapping_add(copy),
+            alpha: unit_alpha(start_alpha + delta_alpha * i as f64),
+        };
         // Later styles traverse geometry directly, so it must be in paint order too.
         for copy in 0..repeater.copies {
             let i = match repeater.composite {
@@ -442,11 +535,7 @@ impl Batch {
                 RepeaterComposite::Above => copy,
             };
             let transform = repeater.transform(i);
-            let copy_layer = CopyLayer {
-                id: self.next_copy,
-                alpha: start_alpha + delta_alpha * i as f64,
-            };
-            self.next_copy += 1;
+            let copy_layer = copy_scope(copy, i);
             for geometry in &self.repeat_geometries {
                 let mut geometry = geometry.clone();
                 geometry.trim_order += i * geometry_count;
@@ -470,6 +559,8 @@ impl Batch {
                 draw.geometry = copy_start + start..copy_start + end;
                 draw.transform = transform * draw.transform;
                 draw.repeater_depth += 1;
+                // The copy holds the styles it repeats, along with any groups inside it.
+                draw.scopes.insert(0, copy_scope(copy, i));
                 self.draws.push(draw);
             }
         }
@@ -553,14 +644,13 @@ impl Batch {
         self.trim_elements.clear();
     }
 
-    fn render(&self, scene: &mut impl RenderSink, clip_bounds: &Rect) {
-        let mut active_copies: &[CopyLayer] = &[];
-        let mut active_draw = None;
-        let mut active_repeater_depth = 0;
-        let mut path = Vec::new();
-
+    /// Lists the draw calls in paint order, leaving out those that would draw nothing.
+    fn collect_calls(&mut self) {
         for (draw_index, draw) in self.draws.iter().enumerate().rev() {
-            if draw.alpha <= 0.0 || !draw.transform.is_finite() {
+            if draw.alpha <= 0.0
+                || !draw.transform.is_finite()
+                || draw.scopes.iter().any(|scope| scope.alpha <= 0.0)
+            {
                 continue;
             }
             let style_inverse = draw.transform.inverse();
@@ -568,63 +658,122 @@ impl Batch {
             if !style_inverse.is_finite() {
                 continue;
             }
+            let mut start = draw.geometry.start;
             // Compound paths must be assembled after group transforms and modifiers are resolved.
             for geometries in self.geometries[draw.geometry.clone()]
                 .chunk_by(|a, b| a.opacity_copies() == b.opacity_copies())
             {
-                let copies = geometries[0].opacity_copies();
-                if copies.iter().any(|copy| copy.alpha <= 0.0) {
+                let range = start..start + geometries.len();
+                start = range.end;
+                if geometries[0]
+                    .opacity_copies()
+                    .iter()
+                    .any(|copy| copy.alpha <= 0.0)
+                {
                     continue;
                 }
-
-                let shared = active_copies
-                    .iter()
-                    .zip(copies)
-                    .enumerate()
-                    .take_while(|(depth, (active, next))| {
-                        active.id == next.id
-                            && (active_draw == Some(draw_index)
-                                || (*depth < active_repeater_depth && *depth < draw.repeater_depth))
-                    })
-                    .count();
-                for copy in active_copies[shared..].iter().rev() {
-                    if copy.alpha != 1.0 {
-                        scene.pop_layer();
-                    }
+                let has_path = geometries.iter().any(|geometry| {
+                    !geometry.elements.is_empty()
+                        && (geometry.transform == draw.transform
+                            || (style_inverse * geometry.transform).is_finite())
+                });
+                if has_path {
+                    self.calls.push(DrawCall {
+                        draw: draw_index,
+                        geometries: range,
+                    });
                 }
-                for copy in &copies[shared..] {
-                    if copy.alpha != 1.0 {
-                        scene.push_layer(
-                            Mix::Normal,
-                            copy.alpha as _,
-                            Affine::IDENTITY,
-                            clip_bounds,
-                        );
-                    }
-                }
-                active_copies = copies;
-                active_draw = Some(draw_index);
-                active_repeater_depth = draw.repeater_depth;
-                self.render_draw(draw, style_inverse, geometries, &mut path, scene);
             }
         }
-        for copy in active_copies.iter().rev() {
-            if copy.alpha != 1.0 {
-                scene.pop_layer();
+    }
+
+    /// Number of calls to [`RenderSink::draw`] that [`Self::render`] makes.
+    fn draw_calls(&self) -> usize {
+        self.calls.len()
+    }
+
+    /// Opacity scopes around a draw call, outermost first: those of the style, then the repeater
+    /// copies of the geometry that did not copy the style itself.
+    fn scopes(&self, call: &DrawCall) -> (&[OpacityScope], &[OpacityScope]) {
+        let draw = &self.draws[call.draw];
+        let copies = self.geometries[call.geometries.start].opacity_copies();
+        (
+            &draw.scopes,
+            &copies[draw.repeater_depth.min(copies.len())..],
+        )
+    }
+
+    /// Number of opacity scopes, counted from the outermost, that hold both draw calls.
+    fn shared_scopes(&self, a: &DrawCall, b: &DrawCall) -> usize {
+        fn common(a: &[OpacityScope], b: &[OpacityScope]) -> usize {
+            a.iter().zip(b).take_while(|(a, b)| a == b).count()
+        }
+        let (a_style, a_copies) = self.scopes(a);
+        let (b_style, b_copies) = self.scopes(b);
+        if a.draw == b.draw {
+            a_style.len() + common(a_copies, b_copies)
+        } else {
+            // Copies that did not copy the style belong to that style alone.
+            common(a_style, b_style)
+        }
+    }
+
+    /// Emits the draw calls. `alpha` is opacity of the layer that is left to the brushes.
+    ///
+    /// The opacity of a group or repeater copy applies to its content as a whole. A scope that
+    /// holds several draw calls becomes a layer around them. A scope that holds one draw call is
+    /// multiplied into its brush instead, which gives the same result without a layer.
+    fn render(&self, scene: &mut impl RenderSink, clip_bounds: &Rect, alpha: f64) {
+        let mut path = Vec::new();
+        // Scopes shared with the previous draw call are open layers.
+        let mut shared_previous = 0;
+        for (index, call) in self.calls.iter().enumerate() {
+            let draw = &self.draws[call.draw];
+            let (style_scopes, copy_scopes) = self.scopes(call);
+            let scopes = || style_scopes.iter().chain(copy_scopes).enumerate();
+            let shared_next = self
+                .calls
+                .get(index + 1)
+                .map_or(0, |next| self.shared_scopes(call, next));
+            let mut brush_alpha = alpha * draw.alpha;
+            for (depth, scope) in scopes().skip(shared_previous) {
+                if scope.alpha == 1.0 {
+                    continue;
+                }
+                if depth < shared_next {
+                    scene.push_layer(Mix::Normal, scope.alpha as _, Affine::IDENTITY, clip_bounds);
+                } else {
+                    brush_alpha *= scope.alpha;
+                }
             }
+            self.render_draw(
+                draw,
+                brush_alpha,
+                &self.geometries[call.geometries.clone()],
+                &mut path,
+                scene,
+            );
+            let open = shared_previous.max(shared_next);
+            for (_, scope) in scopes().take(open).skip(shared_next) {
+                if scope.alpha != 1.0 {
+                    scene.pop_layer();
+                }
+            }
+            shared_previous = shared_next;
         }
     }
 
     fn render_draw(
         &self,
         draw: &DrawData,
-        style_inverse: Affine,
+        alpha: f64,
         geometries: &[GeometryData],
         path: &mut Vec<PathEl>,
         scene: &mut impl RenderSink,
     ) {
-        let modified_brush = if draw.alpha != 1.0 {
-            Some(draw.brush.clone().multiply_alpha(draw.alpha as _))
+        let style_inverse = draw.transform.inverse();
+        let modified_brush = if alpha != 1.0 {
+            Some(draw.brush.clone().multiply_alpha(alpha as _))
         } else {
             None
         };
@@ -656,9 +805,10 @@ impl Batch {
         self.elements.clear();
         self.geometries.clear();
         self.draws.clear();
+        self.calls.clear();
         self.repeat_geometries.clear();
         self.repeat_draws.clear();
-        self.next_copy = 0;
+        self.next_scope = 0;
         self.trim_elements.clear();
     }
 }
@@ -847,5 +997,579 @@ mod tests {
                 Event::Pop,
             ]
         );
+    }
+
+    /// Two overlapping rectangles with one fill each, listed as two groups.
+    fn two_fills() -> Vec<serde_json::Value> {
+        vec![
+            group(vec![rect(0.0, 0.0, 20.0, 20.0), fill(100.0)], 100.0),
+            group(vec![rect(10.0, 10.0, 30.0, 30.0), fill(100.0)], 100.0),
+        ]
+    }
+
+    #[test]
+    fn translucent_layer_with_overlapping_content_is_composited_as_a_group() {
+        let layer = with(shape_layer(1, json!(two_fills())), opacity(50.0));
+        assert_eq!(
+            trace(&composition(json!([layer])), 0.0),
+            ["clip", "layer(0.5)", "fill(1)", "fill(1)", "pop", "pop"]
+        );
+    }
+
+    #[test]
+    fn translucent_layer_with_one_draw_call_fades_its_brush() {
+        let shapes = json!([rect(0.0, 0.0, 20.0, 20.0), fill(50.0)]);
+        let layer = with(shape_layer(1, shapes), opacity(50.0));
+        assert_eq!(
+            trace(&composition(json!([layer])), 0.0),
+            ["clip", "fill(0.25)", "pop"]
+        );
+    }
+
+    #[test]
+    fn translucent_group_with_overlapping_content_is_composited_as_a_group() {
+        let shapes = json!([
+            group(two_fills(), 50.0),
+            rect(0.0, 0.0, 5.0, 5.0),
+            fill(100.0),
+        ]);
+        assert_eq!(
+            trace(&composition(json!([shape_layer(1, shapes)])), 0.0),
+            [
+                "clip",
+                "fill(1)",
+                "layer(0.5)",
+                "fill(1)",
+                "fill(1)",
+                "pop",
+                "pop"
+            ]
+        );
+    }
+
+    #[test]
+    fn translucent_group_with_one_draw_call_fades_its_brush() {
+        let shapes = json!([
+            group(vec![rect(0.0, 0.0, 20.0, 20.0), fill(50.0)], 50.0),
+            group(vec![rect(10.0, 10.0, 30.0, 30.0), stroke(100.0)], 20.0),
+        ]);
+        assert_eq!(
+            trace(&composition(json!([shape_layer(1, shapes)])), 0.0),
+            ["clip", "stroke(0.2)", "fill(0.25)", "pop"]
+        );
+    }
+
+    #[test]
+    fn opacities_around_one_draw_call_multiply_into_its_brush() {
+        let shapes = json!([group(
+            vec![group(vec![rect(0.0, 0.0, 20.0, 20.0), fill(50.0)], 50.0)],
+            50.0
+        )]);
+        let layer = with(shape_layer(1, shapes), opacity(50.0));
+        assert_eq!(
+            trace(&composition(json!([layer])), 0.0),
+            ["clip", "fill(0.0625)", "pop"]
+        );
+    }
+
+    #[test]
+    fn nested_translucent_groups_nest_their_layers() {
+        // The outer group holds three draw calls and the inner group two of them.
+        let shapes = json!([group(
+            vec![
+                group(two_fills(), 50.0),
+                rect(0.0, 0.0, 5.0, 5.0),
+                stroke(100.0),
+            ],
+            25.0
+        )]);
+        assert_eq!(
+            trace(&composition(json!([shape_layer(1, shapes)])), 0.0),
+            [
+                "clip",
+                "layer(0.25)",
+                "stroke(1)",
+                "layer(0.5)",
+                "fill(1)",
+                "fill(1)",
+                "pop",
+                "pop",
+                "pop"
+            ]
+        );
+    }
+
+    #[test]
+    fn translucent_precomposition_is_composited_as_a_group() {
+        let child = |ind| shape_layer(ind, json!([rect(0.0, 0.0, 20.0, 20.0), fill(100.0)]));
+        let composition = composition_with_assets(
+            json!([precomp(
+                "comp",
+                json!([child(1), with(child(2), opacity(50.0))])
+            )]),
+            json!([with(precomp_layer(1, "comp"), opacity(50.0))]),
+        );
+        // The children do not take the opacity of the precomposition layer themselves.
+        assert_eq!(
+            trace(&composition, 0.0),
+            ["clip", "layer(0.5)", "fill(0.5)", "fill(1)", "pop", "pop"]
+        );
+    }
+
+    #[test]
+    fn translucent_precomposition_with_one_drawing_layer_hands_down_its_opacity() {
+        let shapes = || json!([rect(0.0, 0.0, 20.0, 20.0), fill(100.0)]);
+        let assets = json!([
+            precomp(
+                "single",
+                json!([
+                    with(shape_layer(1, shapes()), opacity(50.0)),
+                    // Neither a null layer nor an inactive layer draws.
+                    layer(3, 2),
+                    with(shape_layer(3, shapes()), json!({ "ip": 30 })),
+                ])
+            ),
+            precomp("overlapping", json!([shape_layer(1, json!(two_fills()))])),
+        ]);
+        let single = composition_with_assets(
+            assets.clone(),
+            json!([with(precomp_layer(1, "single"), opacity(50.0))]),
+        );
+        assert_eq!(trace(&single, 0.0), ["clip", "fill(0.25)", "pop"]);
+        // Once the second shape layer is active the precomposition needs a layer.
+        assert_eq!(
+            trace(&single, 30.0),
+            ["clip", "layer(0.5)", "fill(1)", "fill(0.5)", "pop", "pop"]
+        );
+
+        // The layer that takes the opacity composites its own overlapping content.
+        let overlapping = composition_with_assets(
+            assets,
+            json!([with(precomp_layer(1, "overlapping"), opacity(50.0))]),
+        );
+        assert_eq!(
+            trace(&overlapping, 0.0),
+            ["clip", "layer(0.5)", "fill(1)", "fill(1)", "pop", "pop"]
+        );
+    }
+
+    #[test]
+    fn caller_alpha_applies_to_the_animation_as_a_whole() {
+        let shapes = || json!([rect(0.0, 0.0, 20.0, 20.0), fill(100.0)]);
+        let two_layers = composition(json!([shape_layer(1, shapes()), shape_layer(2, shapes())]));
+        assert_eq!(
+            trace_with_alpha(&two_layers, 0.0, 0.5),
+            ["layer(0.5)", "fill(1)", "fill(1)", "pop"]
+        );
+        // The opacity layer takes the place of the composition clip.
+        assert!(matches!(
+            &render(&two_layers, 0.0, 0.5)[0],
+            Event::PushLayer { bounds, .. } if *bounds == Rect::new(0.0, 0.0, 100.0, 100.0)
+        ));
+
+        let one_layer = composition(json!([shape_layer(1, shapes())]));
+        assert_eq!(
+            trace_with_alpha(&one_layer, 0.0, 0.5),
+            ["clip", "fill(0.5)", "pop"]
+        );
+
+        let one_layer_two_fills = composition(json!([shape_layer(1, json!(two_fills()))]));
+        assert_eq!(
+            trace_with_alpha(&one_layer_two_fills, 0.0, 0.5),
+            ["clip", "layer(0.5)", "fill(1)", "fill(1)", "pop", "pop"]
+        );
+
+        assert!(render(&two_layers, 0.0, 0.0).is_empty());
+    }
+
+    #[test]
+    fn transparent_content_is_skipped() {
+        let shapes = || json!([rect(0.0, 0.0, 20.0, 20.0), fill(100.0)]);
+        let transparent_layer = composition(json!([
+            with(shape_layer(1, json!(two_fills())), opacity(0.0)),
+            shape_layer(2, shapes()),
+        ]));
+        assert_eq!(
+            render(&transparent_layer, 0.0, 1.0)
+                .iter()
+                .map(Event::to_string)
+                .collect::<Vec<_>>(),
+            ["clip", "begin(layer 2)", "fill(1)", "end", "pop"]
+        );
+
+        let transparent_group = composition(json!([shape_layer(
+            1,
+            json!([
+                group(two_fills(), 0.0),
+                rect(0.0, 0.0, 5.0, 5.0),
+                fill(100.0)
+            ]),
+        )]));
+        assert_eq!(trace(&transparent_group, 0.0), ["clip", "fill(1)", "pop"]);
+
+        let transparent_style = composition(json!([shape_layer(
+            1,
+            json!([rect(0.0, 0.0, 5.0, 5.0), fill(0.0), stroke(100.0)]),
+        )]));
+        assert_eq!(trace(&transparent_style, 0.0), ["clip", "stroke(1)", "pop"]);
+    }
+
+    #[test]
+    fn translucent_layer_with_empty_content_pushes_no_layer() {
+        let composition = composition(json!([
+            with(shape_layer(1, json!([fill(100.0)])), opacity(50.0)),
+            with(layer(3, 2), opacity(50.0)),
+        ]));
+        assert_eq!(trace(&composition, 0.0), ["clip", "pop"]);
+    }
+
+    #[test]
+    fn matte_source_keeps_its_own_opacity() {
+        let source = with(
+            shape_layer(1, json!([rect(0.0, 0.0, 50.0, 50.0), fill(100.0)])),
+            json!({ "td": 1 }),
+        );
+        let matted = |opacity_percent: f64| {
+            with(
+                with(shape_layer(2, json!(two_fills())), json!({ "tt": 1 })),
+                opacity(opacity_percent),
+            )
+        };
+
+        // The layer that holds the matte carries the opacity of the matted layer. The source is
+        // drawn at its own opacity.
+        let translucent = composition(json!([source.clone(), matted(50.0)]));
+        assert_eq!(
+            trace(&translucent, 0.0),
+            [
+                "clip",
+                "layer(0.5)",
+                "fill(1)",
+                "layer(1, SrcIn)",
+                "fill(1)",
+                "fill(1)",
+                "pop",
+                "pop",
+                "pop"
+            ]
+        );
+        let translucent_source =
+            composition(json!([with(source.clone(), opacity(50.0)), matted(50.0)]));
+        assert_eq!(
+            trace(&translucent_source, 0.0)[1..4],
+            ["layer(0.5)", "fill(0.5)", "layer(1, SrcIn)"]
+        );
+
+        // A transparent source leaves the matte layers empty but balanced.
+        let transparent_source =
+            composition(json!([with(source.clone(), opacity(0.0)), matted(100.0)]));
+        assert_eq!(
+            trace(&transparent_source, 0.0),
+            [
+                "clip",
+                "layer(1)",
+                "layer(1, SrcIn)",
+                "fill(1)",
+                "fill(1)",
+                "pop",
+                "pop",
+                "pop"
+            ]
+        );
+
+        // A transparent matted layer is skipped along with its matte.
+        let transparent_target = composition(json!([source, matted(0.0)]));
+        assert_eq!(trace(&transparent_target, 0.0), ["clip", "pop"]);
+    }
+
+    #[test]
+    fn translucent_layer_with_mask_is_composited_before_it_is_clipped() {
+        let mask = json!({
+            "mode": "a",
+            "o": { "a": 0, "k": 100 },
+            "pt": {
+                "a": 0,
+                "k": {
+                    "c": true,
+                    "v": [[0, 0], [40, 0], [40, 40], [0, 40]],
+                    "i": [[0, 0], [0, 0], [0, 0], [0, 0]],
+                    "o": [[0, 0], [0, 0], [0, 0], [0, 0]],
+                },
+            },
+        });
+        let masked = |shapes| {
+            with(
+                with(
+                    shape_layer(1, shapes),
+                    json!({ "masksProperties": [mask.clone()] }),
+                ),
+                opacity(50.0),
+            )
+        };
+        assert_eq!(
+            trace(&composition(json!([masked(json!(two_fills()))])), 0.0),
+            [
+                "clip",
+                "layer(0.5)",
+                "clip",
+                "fill(1)",
+                "fill(1)",
+                "pop",
+                "pop",
+                "pop"
+            ]
+        );
+        let one_fill = json!([rect(0.0, 0.0, 20.0, 20.0), fill(100.0)]);
+        assert_eq!(
+            trace(&composition(json!([masked(one_fill)])), 0.0),
+            ["clip", "clip", "fill(0.5)", "pop", "pop"]
+        );
+    }
+
+    #[test]
+    fn translucent_layer_with_effects_is_always_composited_as_a_group() {
+        let blur = json!({ "ty": 29, "nm": "blur", "ef": [{ "v": { "a": 0, "k": 4 } }] });
+        let layer = with(
+            with(
+                shape_layer(1, json!([rect(0.0, 0.0, 20.0, 20.0), fill(100.0)])),
+                json!({ "ef": [blur] }),
+            ),
+            opacity(50.0),
+        );
+        // The opacity applies to the output of the effect.
+        assert_eq!(
+            trace(&composition(json!([layer])), 0.0),
+            ["clip", "layer(0.5)", "fill(1)", "pop", "pop"]
+        );
+    }
+
+    #[test]
+    fn translucent_image_layer_fades_the_image() {
+        let composition = composition_with_assets(
+            json!([{ "id": "image", "w": 8, "h": 8, "u": "", "p": "image.png", "e": 0 }]),
+            json!([with(
+                with(layer(2, 1), json!({ "refId": "image" })),
+                opacity(50.0)
+            )]),
+        );
+        assert_eq!(
+            trace(&composition, 0.0),
+            ["clip", "clip", "image(image, 0.5)", "pop", "pop"]
+        );
+    }
+
+    #[test]
+    fn repeater_copy_with_one_draw_call_fades_its_brush() {
+        // The copies fade from opaque to transparent; the last one is not drawn.
+        let shapes = json!([
+            rect(0.0, 0.0, 10.0, 10.0),
+            fill(100.0),
+            repeater(3, 20.0, 100.0, 0.0),
+        ]);
+        assert_eq!(
+            trace(&composition(json!([shape_layer(1, shapes)])), 0.0),
+            ["clip", "fill(0.5)", "fill(1)", "pop"]
+        );
+    }
+
+    #[test]
+    fn repeater_copy_with_overlapping_content_is_composited_as_a_group() {
+        let shapes = json!([
+            rect(0.0, 0.0, 10.0, 10.0),
+            fill(100.0),
+            stroke(100.0),
+            repeater(2, 20.0, 100.0, 50.0),
+        ]);
+        assert_eq!(
+            trace(&composition(json!([shape_layer(1, shapes)])), 0.0),
+            [
+                "clip",
+                "layer(0.5)",
+                "stroke(1)",
+                "fill(1)",
+                "pop",
+                "stroke(1)",
+                "fill(1)",
+                "pop"
+            ]
+        );
+    }
+
+    #[test]
+    fn translucent_group_inside_repeater_copy_shares_the_copy_with_its_siblings() {
+        let shapes = json!([
+            group(two_fills(), 50.0),
+            rect(0.0, 0.0, 5.0, 5.0),
+            stroke(100.0),
+            repeater(2, 40.0, 25.0, 25.0),
+        ]);
+        // Each copy composites the stroke together with the group, which is composited first.
+        let copy = [
+            "layer(0.25)",
+            "stroke(1)",
+            "layer(0.5)",
+            "fill(1)",
+            "fill(1)",
+            "pop",
+            "pop",
+        ];
+        let expected: Vec<_> = ["clip"]
+            .into_iter()
+            .chain(copy)
+            .chain(copy)
+            .chain(["pop"])
+            .collect();
+        assert_eq!(
+            trace(&composition(json!([shape_layer(1, shapes)])), 0.0),
+            expected
+        );
+    }
+
+    #[test]
+    fn style_after_a_repeater_takes_the_opacity_of_each_copy() {
+        let shapes = json!([
+            rect(0.0, 0.0, 10.0, 10.0),
+            repeater(2, 20.0, 100.0, 50.0),
+            fill(100.0),
+        ]);
+        let events = render(&composition(json!([shape_layer(1, shapes)])), 0.0, 1.0);
+        let draws: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Draw { alpha, bounds, .. } => Some((*alpha, *bounds)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            draws,
+            [
+                (0.5, Rect::new(20.0, 0.0, 30.0, 10.0)),
+                (1.0, Rect::new(0.0, 0.0, 10.0, 10.0)),
+            ]
+        );
+        assert_eq!(events.len(), 6, "no layer is pushed for a single draw call");
+    }
+
+    #[test]
+    fn layers_stay_balanced_while_opacities_animate() {
+        let fade = |from: f64, to: f64| {
+            json!({
+                "a": 1,
+                "k": [
+                    { "t": 0, "s": [from], "i": { "x": [1], "y": [1] }, "o": { "x": [0], "y": [0] } },
+                    { "t": 30, "s": [to] },
+                ],
+            })
+        };
+        let mut faded_group = group(two_fills(), 100.0);
+        faded_group["it"][2]["o"] = fade(100.0, 0.0);
+        let mut shapes = shape_layer(
+            1,
+            json!([
+                faded_group,
+                rect(0.0, 0.0, 5.0, 5.0),
+                stroke(100.0),
+                repeater(3, 10.0, 100.0, 0.0),
+            ]),
+        );
+        shapes["ks"]["o"] = fade(0.0, 100.0);
+        let mut instance = precomp_layer(1, "comp");
+        instance["ks"]["o"] = fade(100.0, 0.0);
+        let composition = composition_with_assets(
+            json!([precomp(
+                "comp",
+                json!([shapes.clone(), with(shapes, json!({ "ind": 2 }))])
+            )]),
+            json!([instance]),
+        );
+        // `render` panics if pushes and pops do not balance.
+        let mut layers = 0;
+        for frame in 0..=60 {
+            let events = render(&composition, f64::from(frame) / 2.0, 0.5);
+            layers += events
+                .iter()
+                .filter(|event| matches!(event, Event::PushLayer { .. }))
+                .count();
+        }
+        assert!(layers > 0, "the document should need opacity layers");
+    }
+
+    #[test]
+    fn opacity_is_limited_to_the_range_from_zero_to_one() {
+        // Opacity above 100 is full opacity, which needs no layer and leaves brushes alone.
+        let layer = with(
+            shape_layer(
+                1,
+                json!([
+                    group(two_fills(), 150.0),
+                    rect(0.0, 0.0, 5.0, 5.0),
+                    fill(200.0)
+                ]),
+            ),
+            opacity(150.0),
+        );
+        let composition = composition(json!([layer]));
+        let opaque = ["clip", "fill(1)", "fill(1)", "fill(1)", "pop"];
+        assert_eq!(trace(&composition, 0.0), opaque);
+        assert_eq!(trace_with_alpha(&composition, 0.0, 2.0), opaque);
+
+        let copies = json!([
+            rect(0.0, 0.0, 10.0, 10.0),
+            fill(100.0),
+            stroke(100.0),
+            repeater(2, 20.0, 300.0, 300.0),
+        ]);
+        let repeated = crate::test_support::composition(json!([shape_layer(1, copies)]));
+        assert_eq!(
+            trace(&repeated, 0.0),
+            [
+                "clip",
+                "stroke(1)",
+                "fill(1)",
+                "stroke(1)",
+                "fill(1)",
+                "pop"
+            ]
+        );
+
+        // Opacity below zero is no opacity.
+        let negative = with(shape_layer(1, json!(two_fills())), opacity(-50.0));
+        let negative = crate::test_support::composition(json!([negative]));
+        assert_eq!(trace(&negative, 0.0), ["clip", "pop"]);
+        assert!(render(&composition, 0.0, -1.0).is_empty());
+    }
+
+    #[test]
+    fn matte_source_does_not_count_as_a_drawing_layer() {
+        let layers = || {
+            json!([
+                with(
+                    shape_layer(1, json!([rect(0.0, 0.0, 50.0, 50.0), fill(100.0)])),
+                    json!({ "td": 1 }),
+                ),
+                with(
+                    shape_layer(2, json!([rect(0.0, 0.0, 20.0, 20.0), fill(100.0)])),
+                    json!({ "tt": 1 }),
+                ),
+            ])
+        };
+        // The matted layer is the only one that draws, so it takes the opacity, on the layer
+        // that holds its matte. No further layer is needed around the two.
+        let expected = [
+            "clip",
+            "layer(0.5)",
+            "fill(1)",
+            "layer(1, SrcIn)",
+            "fill(1)",
+            "pop",
+            "pop",
+            "pop",
+        ];
+        let precomposed = composition_with_assets(
+            json!([precomp("comp", layers())]),
+            json!([with(precomp_layer(1, "comp"), opacity(50.0))]),
+        );
+        assert_eq!(trace(&precomposed, 0.0), expected);
+        assert_eq!(trace_with_alpha(&composition(layers()), 0.0, 0.5), expected);
     }
 }

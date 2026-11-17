@@ -239,6 +239,11 @@ pub(crate) fn layer(ty: u8, ind: u32) -> Value {
     })
 }
 
+/// A layer transform (`ks`) with the given opacity, for [`with`].
+pub(crate) fn opacity(opacity: f64) -> Value {
+    json!({ "ks": transform(opacity) })
+}
+
 /// A shape layer holding `shapes`.
 pub(crate) fn shape_layer(ind: u32, shapes: Value) -> Value {
     with(layer(4, ind), json!({ "shapes": shapes }))
