@@ -435,10 +435,19 @@ fn may_draw(evaluated: &EvaluatedLayer<'_>) -> bool {
         && !matches!(layer.content, Content::None)
 }
 
-#[derive(Clone, Debug)]
-struct DrawData {
+/// The stroke and brush of a style at a frame.
+#[derive(Debug)]
+struct Paint {
     stroke: Option<fixed::Stroke>,
     brush: fixed::Brush,
+}
+
+#[derive(Clone, Debug)]
+struct DrawData {
+    /// Index into `Batch::paints`. The copies that a repeater makes of a style share its
+    /// paint, so that a brush with many colour stops is held once.
+    paint: usize,
+    stroked: bool,
     fill_rule: Fill,
     /// Opacity of the style itself.
     alpha: f64,
@@ -457,17 +466,14 @@ struct DrawData {
 impl DrawData {
     /// Whether the path of this style holds the geometry.
     fn includes(&self, geometry: &GeometryData) -> bool {
-        let even_odd_fill = self.stroke.is_none() && self.fill_rule == Fill::EvenOdd;
+        let even_odd_fill = !self.stroked && self.fill_rule == Fill::EvenOdd;
         !(geometry.hidden || (even_odd_fill && geometry.repeated_source))
     }
 
-    fn new(draw: &Draw, geometry: Range<usize>, frame: f64) -> Self {
+    fn new(draw: &Draw, paint: usize, geometry: Range<usize>, frame: f64) -> Self {
         Self {
-            stroke: draw
-                .stroke
-                .as_ref()
-                .map(|stroke| stroke.evaluate(frame).into_owned()),
-            brush: draw.brush.evaluate(1.0, frame).into_owned(),
+            paint,
+            stroked: draw.stroke.is_some(),
             fill_rule: draw.fill_rule,
             alpha: unit_alpha(draw.opacity.evaluate(frame) / 100.0),
             transform: Affine::IDENTITY,
@@ -504,6 +510,7 @@ struct Batch {
     elements: Vec<PathEl>,
     geometries: Vec<GeometryData>,
     draws: Vec<DrawData>,
+    paints: Vec<Paint>,
     /// Indices into `draws` of the styles that make a draw call, in paint order.
     calls: Vec<usize>,
     repeat_geometries: Vec<GeometryData>,
@@ -627,8 +634,16 @@ impl Batch {
     }
 
     fn push_draw(&mut self, draw: &Draw, geometry_start: usize, frame: f64) {
+        self.paints.push(Paint {
+            stroke: draw
+                .stroke
+                .as_ref()
+                .map(|stroke| stroke.evaluate(frame).into_owned()),
+            brush: draw.brush.evaluate(1.0, frame).into_owned(),
+        });
         self.draws.push(DrawData::new(
             draw,
+            self.paints.len() - 1,
             geometry_start..self.geometries.len(),
             frame,
         ));
@@ -889,12 +904,13 @@ impl Batch {
         scene: &mut impl RenderSink,
     ) {
         let style_inverse = draw.transform.inverse();
+        let paint = &self.paints[draw.paint];
         let modified_brush = if alpha != 1.0 {
-            Some(draw.brush.clone().multiply_alpha(alpha as _))
+            Some(paint.brush.clone().multiply_alpha(alpha as _))
         } else {
             None
         };
-        let brush = modified_brush.as_ref().unwrap_or(&draw.brush);
+        let brush = modified_brush.as_ref().unwrap_or(&paint.brush);
         let geometry = &geometries[0];
         let path = if geometries.len() == 1
             && geometry.transform == draw.transform
@@ -918,7 +934,7 @@ impl Batch {
         };
         if !path.is_empty() {
             scene.draw(
-                draw.stroke.as_ref(),
+                paint.stroke.as_ref(),
                 draw.fill_rule,
                 draw.transform,
                 brush,
@@ -931,6 +947,7 @@ impl Batch {
         self.elements.clear();
         self.geometries.clear();
         self.draws.clear();
+        self.paints.clear();
         self.calls.clear();
         self.repeat_geometries.clear();
         self.repeat_draws.clear();
@@ -1669,6 +1686,38 @@ mod tests {
                 Rect::new(0.0, 0.0, 10.0, 10.0)
             ]
         );
+    }
+
+    #[test]
+    fn repeater_copies_of_a_style_share_its_brush() {
+        use super::Batch;
+        use crate::model::Content;
+        use kurbo::Affine;
+
+        // A gradient with two hundred colour stops, repeated a hundred times. A brush for each
+        // copy would hold twenty thousand stops.
+        let stops: Vec<f64> = (0..200)
+            .flat_map(|stop| [f64::from(stop) / 199.0, 1.0, 0.0, 0.0])
+            .collect();
+        let mut brush = gradient("gf", 100.0);
+        brush["g"] = json!({ "p": 200, "k": { "a": 0, "k": stops } });
+        let shapes = json!([
+            rect(0.0, 0.0, 10.0, 10.0),
+            brush,
+            stroke(100.0),
+            repeater(100, 1.0, 100.0, 100.0),
+        ]);
+        let composition = composition(json!([shape_layer(1, shapes)]));
+        let Content::Shape(shapes) = &composition.layers[0].content else {
+            panic!("not a shape layer");
+        };
+        let mut batch = Batch::default();
+        batch.evaluate(shapes, Affine::IDENTITY, 0.0);
+        assert_eq!(batch.draw_calls(), 200);
+        assert_eq!(batch.paints.len(), 2);
+        // Every copy still draws with the gradient.
+        let events = render(&composition, 0.0, 1.0);
+        assert_eq!(draw_bounds(&events).len(), 200);
     }
 
     #[test]
