@@ -10,6 +10,7 @@ use super::{
 };
 use kurbo::{Affine, PathEl, Rect};
 use peniko::{Fill, Mix};
+use std::collections::HashMap;
 use std::mem::swap;
 use std::ops::Range;
 
@@ -63,6 +64,12 @@ pub struct Renderer {
     /// Batches to reuse while the shapes of one layer are held for another layer to render.
     spare_batches: Vec<Batch>,
     mask_elements: Vec<PathEl>,
+    /// Whether layers that were asked make a draw call, by the address of their evaluation.
+    /// Asking evaluates the shapes of a layer, so each layer is asked once per frame.
+    layer_draws: HashMap<usize, bool>,
+    /// Number of times the shapes of a layer were evaluated to find out whether it draws.
+    #[cfg(test)]
+    shape_probes: usize,
 }
 
 impl Renderer {
@@ -117,6 +124,7 @@ impl Renderer {
     ) {
         let animation = evaluated.composition;
         self.batch.clear();
+        self.layer_draws.clear();
         let alpha = unit_alpha(alpha);
         if alpha <= 0.0 {
             return;
@@ -352,20 +360,32 @@ impl Renderer {
         evaluated: &EvaluatedLayer<'_>,
         output_transform: Affine,
     ) -> bool {
-        match &evaluated.layer.content {
+        // A layer in nested precompositions is asked about by each of them that has a blend
+        // mode, and by the precompositions that hold those.
+        let key = std::ptr::from_ref(evaluated) as usize;
+        if let Some(draws) = self.layer_draws.get(&key) {
+            return *draws;
+        }
+        let draws = match &evaluated.layer.content {
             Content::None => false,
             Content::Instance { .. } => {
                 self.any_layer_draws(animation, &evaluated.children, output_transform)
             }
             Content::Image { asset_id } => animation.images.contains_key(asset_id),
             Content::Shape(shapes) => {
+                #[cfg(test)]
+                {
+                    self.shape_probes += 1;
+                }
                 let transform = output_transform * evaluated.full_transform;
                 self.batch.evaluate(shapes, transform, evaluated.frame);
                 let draws = self.batch.draw_calls() > 0;
                 self.batch.clear();
                 draws
             }
-        }
+        };
+        self.layer_draws.insert(key, draws);
+        draws
     }
 }
 
@@ -1979,6 +1999,33 @@ mod tests {
             with(layer(3, 3), json!({ "bm": 1 })),
         ]));
         assert_eq!(trace(&composition, 0.0), ["clip", "pop"]);
+    }
+
+    #[test]
+    fn nested_blended_precompositions_ask_once_whether_a_layer_draws() {
+        // A shape layer with a blend mode inside three precompositions that have one too. Each
+        // of them has to know whether its content draws.
+        let blended = json!({ "bm": 1 });
+        let shape = shape_layer(1, json!([rect(0.0, 0.0, 20.0, 20.0), fill(100.0)]));
+        let assets = json!([
+            precomp("a", json!([with(precomp_layer(1, "b"), blended.clone())])),
+            precomp("b", json!([with(precomp_layer(1, "c"), blended.clone())])),
+            precomp("c", json!([with(shape, blended.clone())])),
+        ]);
+        let composition =
+            composition_with_assets(assets, json!([with(precomp_layer(1, "a"), blended)]));
+        let mut renderer = crate::Renderer::new();
+        let mut sink = RecordingSink::default();
+        renderer
+            .try_append(&composition, 0.0, kurbo::Affine::IDENTITY, 1.0, &mut sink)
+            .unwrap();
+        sink.assert_balanced();
+        assert_eq!(renderer.shape_probes, 1);
+        // The next frame asks again.
+        renderer
+            .try_append(&composition, 1.0, kurbo::Affine::IDENTITY, 1.0, &mut sink)
+            .unwrap();
+        assert_eq!(renderer.shape_probes, 2);
     }
 
     #[test]
