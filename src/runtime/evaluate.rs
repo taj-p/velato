@@ -2,11 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 use super::Composition;
-use super::model::{Content, Layer, LayerReference, PathCheck, Shape, TransformComponents};
+use super::model::{
+    Content, ImageAsset, Layer, LayerReference, PathCheck, Shape, TransformComponents,
+};
 use super::render::{check_fixed_shapes, count_shapes, evaluate_paths};
 use crate::limits::{Limit, Limits, ShapeCheck, ShapeCost, ShapeError};
 use kurbo::{Affine, PathEl, Point};
 use peniko::BlendMode;
+use std::collections::HashMap;
 
 /// Nested layer indices, not Lottie IDs; valid only for this composition layout.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -185,6 +188,72 @@ pub struct AuthoredPath {
 pub struct EvaluatedComposition<'a> {
     pub(crate) composition: &'a Composition,
     pub layers: Vec<EvaluatedLayer<'a>>,
+    /// The images of the image layers, by the address of the identifier that a layer names
+    /// its image by.
+    pub(crate) images: HashMap<usize, &'a ImageAsset>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Number of times that a precomposition or an image was looked up by its identifier on
+    /// this thread.
+    pub(crate) static LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The precompositions and images that the layers of a composition refer to.
+///
+/// A layer names its precomposition or image by an identifier, and finding it takes time in
+/// proportion to the length of that identifier. A layer of a precomposition is evaluated once
+/// for each layer that shows the precomposition, so what it refers to is looked up by the
+/// identifier the first time, and by the address of the identifier from then on. The lookups
+/// of a frame then take time in proportion to the identifiers in the animation, however often
+/// its layers are shown.
+#[derive(Debug, Default)]
+struct References<'a> {
+    precompositions: HashMap<usize, &'a Vec<Layer>>,
+    images: HashMap<usize, &'a ImageAsset>,
+}
+
+impl<'a> References<'a> {
+    /// The key of an identifier. Identifiers at the same address are the same identifier.
+    fn key(id: &str) -> usize {
+        id.as_ptr() as usize
+    }
+
+    fn precomposition(
+        &mut self,
+        animation: &'a Composition,
+        id: &'a str,
+    ) -> Option<&'a Vec<Layer>> {
+        let key = Self::key(id);
+        if let Some(layers) = self.precompositions.get(&key) {
+            return Some(layers);
+        }
+        #[cfg(test)]
+        LOOKUPS.set(LOOKUPS.get() + 1);
+        let layers = animation.assets.get(id)?;
+        self.precompositions.insert(key, layers);
+        Some(layers)
+    }
+
+    fn image(&mut self, animation: &'a Composition, id: &'a str) -> Option<&'a ImageAsset> {
+        let key = Self::key(id);
+        if let Some(image) = self.images.get(&key) {
+            return Some(image);
+        }
+        #[cfg(test)]
+        LOOKUPS.set(LOOKUPS.get() + 1);
+        let image = animation.images.get(id)?;
+        self.images.insert(key, image);
+        Some(image)
+    }
+}
+
+impl<'a> EvaluatedComposition<'a> {
+    /// Returns the image that an image layer of this evaluation names by `id`.
+    pub(crate) fn image(&self, id: &str) -> Option<&'a ImageAsset> {
+        self.images.get(&References::key(id)).copied()
+    }
 }
 
 impl EvaluatedComposition<'_> {
@@ -228,6 +297,7 @@ impl Composition {
             counted: ShapeCost::default(),
             prefix: Vec::new(),
             assets: Vec::new(),
+            references: References::default(),
         };
         let (layers, rendered) =
             evaluation.evaluate_layers(&self.layers, frame, Affine::IDENTITY, true, true)?;
@@ -246,6 +316,7 @@ impl Composition {
         Ok(EvaluatedComposition {
             composition: self,
             layers,
+            images: evaluation.references.images,
         })
     }
 
@@ -289,6 +360,7 @@ impl Composition {
             limits,
             layers: 0,
             assets: Vec::new(),
+            references: References::default(),
         };
         structure
             .visit_layers(&self.layers, 1)
@@ -369,7 +441,8 @@ struct Structure<'a> {
     /// Layers visited.
     layers: usize,
     /// Precompositions that hold the layers being visited.
-    assets: Vec<&'a str>,
+    assets: Vec<&'a Vec<Layer>>,
+    references: References<'a>,
 }
 
 impl<'a> Structure<'a> {
@@ -415,10 +488,10 @@ impl<'a> Structure<'a> {
         // Likewise, evaluation reports a precomposition that holds itself, and one that is
         // missing.
         if let Content::Instance { name, .. } = &layers[index].content
-            && !self.assets.contains(&name.as_str())
-            && let Some(children) = self.animation.assets.get(name)
+            && let Some(children) = self.references.precomposition(self.animation, name)
+            && !self.assets.iter().any(|held| std::ptr::eq(*held, children))
         {
-            self.assets.push(name);
+            self.assets.push(children);
             self.visit_layers(children, depth + 1)?;
             self.assets.pop();
         }
@@ -514,7 +587,8 @@ struct Evaluation<'a> {
     /// Indices of the precomposition layers that hold the layers being evaluated.
     prefix: Vec<usize>,
     /// Their precompositions.
-    assets: Vec<String>,
+    assets: Vec<&'a Vec<Layer>>,
+    references: References<'a>,
 }
 
 impl<'a> Evaluation<'a> {
@@ -648,15 +722,16 @@ impl<'a> Evaluation<'a> {
                     if !child_frame.is_finite() {
                         return Err(EvaluationError::NonFiniteTime);
                     }
-                    if self.assets.contains(name) {
+                    // A precomposition that holds itself is one that exists, so looking it
+                    // up first reports the same errors.
+                    let children = self
+                        .references
+                        .precomposition(self.animation, name)
+                        .ok_or_else(|| EvaluationError::MissingAsset(name.clone()))?;
+                    if self.assets.iter().any(|held| std::ptr::eq(*held, children)) {
                         return Err(EvaluationError::PrecompCycle(name.clone()));
                     }
-                    let children = self
-                        .animation
-                        .assets
-                        .get(name)
-                        .ok_or_else(|| EvaluationError::MissingAsset(name.clone()))?;
-                    self.assets.push(name.clone());
+                    self.assets.push(children);
                     self.prefix.push(*node.path.0.last().unwrap());
                     (node.children, *content) = self.evaluate_layers(
                         children,
@@ -669,7 +744,7 @@ impl<'a> Evaluation<'a> {
                     self.assets.pop();
                 }
                 Content::Image { asset_id } => {
-                    if !self.animation.images.contains_key(asset_id) {
+                    if self.references.image(self.animation, asset_id).is_none() {
                         return Err(EvaluationError::MissingAsset(asset_id.clone()));
                     }
                 }

@@ -107,6 +107,52 @@ mod tests {
     }
 
     #[test]
+    fn value_that_nests_too_deep_is_refused_without_recursion() {
+        // Arrays and objects in turn, a hundred thousand deep. Reading such a value, or
+        // only dropping it, recurses once per level.
+        let nested = |levels: usize| {
+            let mut value = json!(1);
+            for level in 0..levels {
+                // Put together by hand: `json!` would copy the value, level by level.
+                value = if level % 2 == 0 {
+                    serde_json::Value::Array(vec![value])
+                } else {
+                    serde_json::Value::Object([("layers".to_owned(), value)].into_iter().collect())
+                };
+            }
+            value
+        };
+        // On a stack that a few hundred levels of recursion fit.
+        let refused = std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(move || {
+                let error = Animation::from_json(nested(100_000)).unwrap_err();
+                assert!(error.to_string().contains("recursion limit"), "{error}");
+                let composition = crate::Composition::from_json(nested(100_000));
+                assert!(matches!(composition, Err(crate::Error::Json(_))));
+            })
+            .unwrap()
+            .join();
+        assert!(refused.is_ok());
+
+        // What the parser takes as text is taken as a value, and no more.
+        let mut at_limit = JSON.to_owned();
+        let mut one_more = JSON.to_owned();
+        // The document is the first level and the array of layers the second.
+        at_limit["layers"] = serde_json::Value::Array(vec![nested(125)]);
+        one_more["layers"] = serde_json::Value::Array(vec![nested(126)]);
+        let text = |value: &serde_json::Value| serde_json::to_string(value).unwrap();
+        let recursion = |error: serde_json::Error| error.to_string().contains("recursion limit");
+        // A layer without a type is kept as it is, so the first is an animation.
+        assert!(Animation::from_json(at_limit.clone()).is_ok());
+        assert!(text(&at_limit).parse::<Animation>().is_ok());
+        assert!(recursion(
+            Animation::from_json(one_more.clone()).unwrap_err()
+        ));
+        assert!(recursion(text(&one_more).parse::<Animation>().unwrap_err()));
+    }
+
+    #[test]
     fn size_round_trips() {
         let value = serde_json::to_value(&*LOTTIE).unwrap();
         assert_eq!((&value["w"], &value["h"]), (&json!(512), &json!(512)));

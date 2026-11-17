@@ -63,33 +63,13 @@ impl Composition {
 
     /// Creates a new runtime composition from a json object of Lottie file contents.
     ///
-    /// Fails for a value in which arrays and objects nest deeper than 128 levels, which is
+    /// Fails for a value in which arrays and objects nest deeper than 127 levels, which is
     /// what the JSON parser takes when it reads a file.
     pub fn from_json(v: serde_json::Value) -> Result<Composition, Error> {
-        if !nests_within(&v, 128) {
-            let error: serde_json::Error = serde::de::Error::custom("recursion limit exceeded");
-            return Err(error.into());
-        }
+        // The schema refuses a value that nests too deep.
         let source = Animation::from_json(v)?;
         import::conv_animation(source)
     }
-}
-
-/// Whether the arrays and objects of a value nest no deeper than `depth` levels.
-fn nests_within(value: &serde_json::Value, depth: usize) -> bool {
-    let mut values = vec![(value, 1)];
-    while let Some((value, level)) = values.pop() {
-        let nested: Box<dyn Iterator<Item = &serde_json::Value>> = match value {
-            serde_json::Value::Array(values) => Box::new(values.iter()),
-            serde_json::Value::Object(values) => Box::new(values.values()),
-            _ => continue,
-        };
-        if level > depth {
-            return false;
-        }
-        values.extend(nested.map(|value| (value, level + 1)));
-    }
-    true
 }
 
 impl std::str::FromStr for Composition {

@@ -159,7 +159,7 @@ impl Renderer {
         // are composited first, and layers with a blend mode blend with the animation only.
         // That layer also serves as the composition clip.
         let isolate_opacity = (alpha != 1.0 && drawing_layers(&evaluated.layers) > 1)
-            || self.has_blending_layer(animation, &evaluated.layers, transform);
+            || self.has_blending_layer(evaluated, &evaluated.layers, transform);
         if isolate_opacity {
             scene.push_layer(Mix::Normal, alpha as f32, transform, &clip);
         } else {
@@ -171,7 +171,7 @@ impl Renderer {
                 continue;
             }
             self.render_layer(
-                animation,
+                evaluated,
                 &evaluated.layers,
                 layer,
                 layer_index,
@@ -189,7 +189,7 @@ impl Renderer {
     #[expect(clippy::too_many_arguments, reason = "Deferred")]
     fn render_layer(
         &mut self,
-        animation: &Composition,
+        animation: &EvaluatedComposition<'_>,
         layer_set: &[EvaluatedLayer<'_>],
         evaluated: &EvaluatedLayer<'_>,
         layer_index: usize,
@@ -231,13 +231,19 @@ impl Renderer {
             return;
         }
         scene.begin_layer_group(&layer.name, layer_index);
-        let full_rect = Rect::new(0.0, 0.0, animation.width as f64, animation.height as f64);
+        let composition = animation.composition;
+        let full_rect = Rect::new(
+            0.0,
+            0.0,
+            composition.width as f64,
+            composition.height as f64,
+        );
         // Shapes are evaluated before anything is pushed, so that the number of draw calls is
         // known.
         let draw_calls = match &layer.content {
             Content::None => 0,
             Content::Instance { .. } => drawing_layers(&evaluated.children),
-            Content::Image { asset_id } => usize::from(animation.images.contains_key(asset_id)),
+            Content::Image { asset_id } => usize::from(animation.image(asset_id).is_some()),
             Content::Shape(shapes) => {
                 self.batch.evaluate(shapes, transform, frame);
                 self.batch.draw_calls()
@@ -347,7 +353,7 @@ impl Renderer {
                 }
             }
             Content::Image { asset_id } => {
-                if let Some(image) = animation.images.get(asset_id) {
+                if let Some(image) = animation.image(asset_id) {
                     // Lottie requires visuals to stay within authored image bounds.
                     let bounds = image
                         .width
@@ -377,7 +383,7 @@ impl Renderer {
     /// Whether a layer that draws at this frame has a blend mode.
     fn has_blending_layer(
         &mut self,
-        animation: &Composition,
+        animation: &EvaluatedComposition<'_>,
         layers: &[EvaluatedLayer<'_>],
         output_transform: Affine,
     ) -> bool {
@@ -390,7 +396,7 @@ impl Renderer {
 
     fn any_layer_draws(
         &mut self,
-        animation: &Composition,
+        animation: &EvaluatedComposition<'_>,
         layers: &[EvaluatedLayer<'_>],
         output_transform: Affine,
     ) -> bool {
@@ -403,7 +409,7 @@ impl Renderer {
     /// of a shape layer, so it is only asked of layers with a blend mode.
     fn layer_draws(
         &mut self,
-        animation: &Composition,
+        animation: &EvaluatedComposition<'_>,
         evaluated: &EvaluatedLayer<'_>,
         output_transform: Affine,
     ) -> bool {
@@ -418,7 +424,7 @@ impl Renderer {
             Content::Instance { .. } => {
                 self.any_layer_draws(animation, &evaluated.children, output_transform)
             }
-            Content::Image { asset_id } => animation.images.contains_key(asset_id),
+            Content::Image { asset_id } => animation.image(asset_id).is_some(),
             Content::Shape(shapes) => {
                 #[cfg(test)]
                 {

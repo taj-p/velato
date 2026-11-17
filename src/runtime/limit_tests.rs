@@ -805,7 +805,7 @@ fn shape_groups_made_in_code_are_limited_in_depth() {
 const STACK_FOR_NESTING: usize = 256 * 1024;
 
 /// The most shape groups that a shape layer of a precomposition can nest. The JSON parser
-/// takes 128 levels of arrays and objects, and a group is two of them.
+/// takes 127 levels of arrays and objects, and a group is two of them.
 const NESTED_GROUPS: usize = 59;
 
 #[test]
@@ -1156,6 +1156,176 @@ fn layer_made_in_code_is_counted_at_each_frame() {
         evaluation_limit(&made, 0.0, &limits(7)),
         Some(Limit::PathElements)
     );
+}
+
+#[test]
+fn precompositions_and_images_are_looked_up_once_for_each_layer() {
+    use super::evaluate::LOOKUPS;
+    // Thirty layers that each show a precomposition of twenty layers, which each show a
+    // precomposition of an image layer and a precomposition layer: 1,800 layers at a frame.
+    // Finding a precomposition or an image by its identifier takes time in proportion to the
+    // length of the identifier, so it is done once for each layer that is written in the
+    // file, and not once for each time that the layer is shown.
+    let image = with(layer(2, 1), json!({ "refId": "image" }));
+    let assets = json!([
+        precomp("outer", (1..=20).map(|ind| precomp_layer(ind, "inner")).collect()),
+        precomp("inner", json!([image, precomp_layer(2, "empty")])),
+        precomp("empty", json!([])),
+        { "id": "image", "w": 10, "h": 10, "u": "", "p": "image.png" },
+    ]);
+    let layers: Value = (1..=30).map(|ind| precomp_layer(ind, "outer")).collect();
+    LOOKUPS.set(0);
+    let composition = import(assets, layers).unwrap();
+    // Import goes through the precompositions as rendering does, and finds no images.
+    let written = 30 + 20 + 1;
+    assert_eq!(LOOKUPS.get(), written);
+    LOOKUPS.set(0);
+    let evaluated = composition.evaluate(0.0).unwrap();
+    assert_eq!(LOOKUPS.get(), written + 1);
+    assert_eq!(evaluated.layers.len(), 30);
+    assert_eq!(evaluated.layers[29].children[19].children.len(), 2);
+    // Rendering draws the image six hundred times, and looks nothing up.
+    LOOKUPS.set(0);
+    let mut sink = RecordingSink::default();
+    Renderer::new().append_evaluated(&evaluated, Affine::IDENTITY, 1.0, &mut sink);
+    let images = sink
+        .events
+        .iter()
+        .filter(|event| matches!(event, Event::Image { .. }))
+        .count();
+    assert_eq!((images, LOOKUPS.get()), (600, 0));
+
+    // A precomposition that holds itself and one that is missing are still told apart.
+    let cyclic = import(
+        json!([
+            precomp("a", json!([precomp_layer(1, "b")])),
+            precomp("b", json!([precomp_layer(1, "a")]))
+        ]),
+        json!([precomp_layer(1, "a")]),
+    )
+    .unwrap();
+    assert_eq!(
+        cyclic.evaluate(0.0).unwrap_err(),
+        EvaluationError::PrecompCycle("a".to_owned())
+    );
+    let missing = import(json!([]), json!([precomp_layer(1, "nowhere")])).unwrap();
+    assert_eq!(
+        missing.evaluate(0.0).unwrap_err(),
+        EvaluationError::MissingAsset("nowhere".to_owned())
+    );
+}
+
+#[test]
+fn composition_made_in_code_is_held_to_the_limits_on_single_shapes() {
+    use super::model::{Brush, ColorStops, Repeater, Shape, animated, fixed};
+    // Import checks the gradients of a file as they are written, before it converts them. A
+    // composition that is put together in code has none of that, so the same limits are
+    // checked on the model: by the evaluation of a frame, and by the check that import ends
+    // with.
+    let over_limit = |change: &dyn Fn(&mut Shape), shapes: Value| {
+        let mut made = import_shapes(shapes).unwrap();
+        assert!(made.evaluate(0.0).is_ok());
+        let Content::Shape(shapes) = &mut made.layers[0].content else {
+            panic!("a shape layer has shapes");
+        };
+        shapes.iter_mut().for_each(change);
+        // Nothing is known about a layer that code has made.
+        made.layers[0].shape_check = ShapeCheck::EveryFrame;
+        let error = render_error(&made, 0.0);
+        assert_eq!(made.evaluate(0.0).unwrap_err(), error);
+        let EvaluationError::LimitExceeded { limit, .. } = error else {
+            panic!("{error}");
+        };
+        assert_eq!(
+            import_limit(made.check_limits(&Limits::DEFAULT).map(|()| made)),
+            limit
+        );
+        limit
+    };
+    let most = MAX_GRADIENT_STOPS;
+    let gradient = |shapes: Value| json!([rect(0.0, 0.0, 10.0, 10.0), shapes]);
+
+    // A gradient of the model has colour stops only: import has folded the transparency
+    // stops of the file into them. One stop more than the most, on a gradient at the limit.
+    let one_more_stop = |shape: &mut Shape| {
+        if let Shape::Draw(draw) = shape {
+            let Brush::Fixed(fixed::Brush::Gradient(gradient)) = &mut draw.brush else {
+                panic!("the gradient is fixed");
+            };
+            assert_eq!(gradient.stops.len(), most);
+            let last = gradient.stops[most - 1];
+            gradient.stops.push(last);
+        }
+    };
+    let at_limit = gradient(gradient_with_stops(most, most, most));
+    assert_eq!(over_limit(&one_more_stop, at_limit), Limit::GradientStops);
+    // Next to a number that is animated, the shapes are not counted when they are checked
+    // without a frame, and the gradient is still found.
+    let next_to_animated_copies = json!([
+        rect(0.0, 0.0, 10.0, 10.0),
+        gradient_with_stops(most, most, most),
+        with(
+            repeater(1, 1.0, 100.0, 100.0),
+            json!({ "c": animated(1.0, 3.0) })
+        ),
+    ]);
+    assert_eq!(
+        over_limit(&one_more_stop, next_to_animated_copies),
+        Limit::GradientStops
+    );
+
+    // The same for a gradient with keyframes, which holds five numbers for each stop.
+    let animated_stops = |shape: &mut Shape| {
+        if let Shape::Draw(draw) = shape {
+            let Brush::Animated(animated::Brush::Gradient(gradient)) = &mut draw.brush else {
+                panic!("the gradient is animated");
+            };
+            let ColorStops::Animated(stops) = &mut gradient.stops else {
+                panic!("the stops are animated");
+            };
+            assert_eq!(stops.count, most);
+            stops.count += 1;
+            for values in &mut stops.values {
+                values.extend([1.0, 0.0, 0.0, 0.0, 1.0]);
+            }
+        }
+    };
+    let mut keyframed = gradient_with_stops(most, most, most);
+    let values = keyframed["g"]["k"]["k"].clone();
+    keyframed["g"]["k"] =
+        json!({ "a": 1, "k": [{ "t": 0, "s": values }, { "t": 60, "s": values }] });
+    assert_eq!(
+        over_limit(&animated_stops, gradient(keyframed)),
+        Limit::GradientStops
+    );
+
+    // A file with as many transparency stops as there may be, and two colour stops, makes a
+    // gradient of two stops.
+    let transparent = import_shapes(gradient(gradient_with_stops(2, most, 2))).unwrap();
+    let stops: Vec<_> = shapes_of(&transparent.layers[0])
+        .iter()
+        .filter_map(|shape| match shape {
+            Shape::Draw(draw) => Some(draw.brush.max_color_stops()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(stops, [2]);
+
+    // Copies of a repeater and points of a star.
+    let more_copies = |shape: &mut Shape| {
+        if let Shape::Repeater(Repeater::Fixed(repeater)) = shape {
+            repeater.copies = MAX_REPEATER_COPIES + 1;
+        }
+    };
+    let repeated = json!([path(2), stroke(100.0), copies(MAX_REPEATER_COPIES)]);
+    assert_eq!(over_limit(&more_copies, repeated), Limit::RepeaterCopies);
+    let more_points = |shape: &mut Shape| {
+        if let Shape::Geometry(Geometry::Star(star)) = shape {
+            star.points = super::model::Value::Fixed(MAX_POLYSTAR_POINTS as f64 + 1.0);
+        }
+    };
+    let star = json!([polystar(1, fixed(MAX_POLYSTAR_POINTS)), fill(100.0)]);
+    assert_eq!(over_limit(&more_points, star), Limit::PolystarPoints);
 }
 
 #[test]

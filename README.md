@@ -63,7 +63,8 @@ One frame may hold 100,000 shapes, 2,000,000 path elements, of which 30,000 unde
 Shape groups may nest 64 deep.
 An animation that is over a limit fails to import, or fails to evaluate at the frame where it is over, with an error that names the limit.
 It is never drawn in part.
-The documentation of the `limits` module says what counts toward each limit.
+Evaluating a frame also fails for a shape or a mask whose path is not finite, and a render sink is handed nothing that is not finite.
+The documentation of the `limits` module says what counts toward each limit, and what a frame at the limits was measured to take: that is the result of a search for the worst animations, not a proof.
 
 ## Usage
 

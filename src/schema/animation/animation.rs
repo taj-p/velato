@@ -99,8 +99,58 @@ impl Animation {
         serde_json::from_slice(v)
     }
 
+    /// Reads an animation from a JSON value.
+    ///
+    /// Fails for a value in which arrays and objects nest deeper than 127 levels, which is
+    /// what the JSON parser takes when it reads a file with [`Self::from_slice`] or
+    /// [`from_str`](std::str::FromStr::from_str). Reading a value recurses once for each
+    /// level, as does dropping it, so a deeper one would overflow the stack; this neither
+    /// reads nor drops such a value by recursing.
+    ///
+    /// The types of the schema can also be read from a value with [`serde_json::from_value`],
+    /// which has no such guard.
     pub fn from_json(v: serde_json::Value) -> Result<Animation, serde_json::Error> {
+        if !nests_within(&v, MAX_NESTING) {
+            drop_without_recursion(v);
+            return Err(Error::custom("recursion limit exceeded"));
+        }
         serde_json::from_value(v)
+    }
+}
+
+/// Most levels of arrays and objects that a JSON value may nest to be read. The JSON parser
+/// takes as many in text: its recursion limit of 128 counts the value inside the innermost.
+const MAX_NESTING: usize = 127;
+
+/// Whether the arrays and objects of a value nest no deeper than `depth` levels.
+fn nests_within(value: &serde_json::Value, depth: usize) -> bool {
+    let mut values = vec![(value, 1)];
+    while let Some((value, level)) = values.pop() {
+        let nested: Box<dyn Iterator<Item = &serde_json::Value>> = match value {
+            serde_json::Value::Array(values) => Box::new(values.iter()),
+            serde_json::Value::Object(values) => Box::new(values.values()),
+            _ => continue,
+        };
+        if level > depth {
+            return false;
+        }
+        values.extend(nested.map(|value| (value, level + 1)));
+    }
+    true
+}
+
+/// Drops a value by taking it apart level by level, which dropping it as it is would do by
+/// recursing.
+fn drop_without_recursion(value: serde_json::Value) {
+    let mut values = vec![value];
+    while let Some(value) = values.pop() {
+        match value {
+            serde_json::Value::Array(items) => values.extend(items),
+            serde_json::Value::Object(items) => {
+                values.extend(items.into_iter().map(|(_, item)| item));
+            }
+            _ => {}
+        }
     }
 }
 

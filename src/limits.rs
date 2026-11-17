@@ -20,14 +20,28 @@
 //!   leaves the sink untouched.
 //!
 //! With these limits, the time and memory that importing takes grow in proportion to the size
-//! of the file, and the time and memory that evaluating and rendering a frame take, and that
-//! the queries of [`EvaluatedLayer`](crate::EvaluatedLayer) take, have a fixed bound.
+//! of the file. The time and memory that evaluating and rendering a frame take, and that the
+//! queries of [`EvaluatedLayer`](crate::EvaluatedLayer) take, depend on what the limits allow
+//! and not on the file, with one exception: each layer of the file that shows a
+//! precomposition or an image finds it by its identifier once per frame, which takes time in
+//! proportion to the length of the identifier.
+//!
+//! What a frame at the limits takes is known from a search for the worst animations that
+//! they admit, and not from a proof. The slowest that were found trim tens of thousands of
+//! curves, and take a few tenths of a second on one core of a desktop machine and a few
+//! hundred megabytes.
 //!
 //! Evaluating and rendering recurse once for each level of nested layers and of nested shape
 //! groups, and nowhere else, so [`MAX_NESTING_DEPTH`] and [`MAX_GROUP_DEPTH`] bound the stack
 //! that they use. An animation that nests as deep as both allow takes less than 256 kilobytes of
 //! stack in a build without optimization. Importing recurses as deep as the JSON parser does,
-//! which is 128 levels of arrays and objects.
+//! which takes 127 levels of arrays and objects, in text and in a value alike.
+//!
+//! The limits are on what an animation asks for, not on its numbers. A path that is not
+//! finite at a frame fails the evaluation of that frame as well, with
+//! [`EvaluationError::InvalidShape`](crate::EvaluationError::InvalidShape), and a path that
+//! lies far from the origin, or is far larger than any screen, is drawn and trimmed in the
+//! time that the same path takes at the origin.
 //!
 //! # What counts
 //!
@@ -61,6 +75,9 @@ pub const MAX_REPEATER_COPIES: usize = 2_000;
 pub const MAX_POLYSTAR_POINTS: usize = 2_000;
 
 /// Most colour stops a gradient may have, and most transparency stops.
+///
+/// The transparency stops are those of a Lottie file, which import folds into the colour
+/// stops. A gradient of a composition that is put together in code has colour stops only.
 pub const MAX_GRADIENT_STOPS: usize = 256;
 
 /// Most shapes in one frame.
@@ -115,7 +132,7 @@ pub const MAX_NESTING_DEPTH: usize = 32;
 /// once per level, so this limits the stack that it uses, together with [`MAX_NESTING_DEPTH`].
 ///
 /// An animation that is read from JSON cannot reach this limit: the parser takes no more than
-/// 128 levels of arrays and objects, and a group is two of them. The limit is there for a
+/// 127 levels of arrays and objects, and a group is two of them. The limit is there for a
 /// composition that is put together in code.
 pub const MAX_GROUP_DEPTH: usize = 64;
 
