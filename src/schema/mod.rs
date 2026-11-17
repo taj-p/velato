@@ -89,4 +89,27 @@ mod tests {
     fn test_can_serialize() {
         serde_json::to_value(&*LOTTIE).unwrap();
     }
+
+    #[test]
+    fn fractional_size_is_rounded_up() {
+        let mut source = JSON.to_owned();
+        source["w"] = json!(58.84);
+        source["h"] = json!(100.0);
+        let animation = Animation::from_json(source).unwrap();
+        assert_eq!((animation.width, animation.height), (59, 100));
+    }
+
+    #[test]
+    fn negative_size_is_rejected() {
+        let mut source = JSON.to_owned();
+        source["w"] = json!(-1);
+        assert!(Animation::from_json(source).is_err());
+    }
+
+    #[test]
+    fn size_round_trips() {
+        let value = serde_json::to_value(&*LOTTIE).unwrap();
+        assert_eq!((&value["w"], &value["h"]), (&json!(512), &json!(512)));
+        assert_eq!(Animation::from_json(value).unwrap(), *LOTTIE);
+    }
 }

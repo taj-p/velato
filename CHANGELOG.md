@@ -51,6 +51,7 @@ This release has an [MSRV][] of 1.88.
 - Gradient fills and gradient strokes now apply their opacity (`o`).
 - Precomposition layers are now clipped to their width and height. A precomposition that covers the composition needs no clip and pushes none.
 - Keyframe lookup no longer depends on which of several keyframes at the same time a binary search returns. The last one applies from that time on, and a span without length is never interpolated.
+- Import now accepts these deviations from the schema that occur in real files: a keyframe value written as a bare number, a static scalar written as an array of one number, a fractional animation width or height (rounded up), and a shape direction (`d`) other than 1 or 3 (read as normal).
 - Keyframes without a start value (`s`) now import. Older exporters end each animated property with a keyframe that holds only a time; it takes the previous keyframe's end value (`e`).
 
 ## [0.12.0][] (2026-09-09)

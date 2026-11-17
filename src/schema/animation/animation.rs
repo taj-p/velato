@@ -7,7 +7,8 @@ use crate::schema::{
     helpers::{int_boolean::BoolInt, marker::Marker, visual_object::VisualObject},
     layers::AnyLayer,
 };
-use serde::{Deserialize, Serialize};
+use serde::de::Error;
+use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt::Display;
 
 /// Top level object, describing the animation
@@ -38,10 +39,14 @@ pub struct Animation {
     #[serde(rename = "op")]
     pub out_point: f64,
     /// Width of the animation
-    #[serde(rename = "w")]
+    ///
+    /// A fractional width is rounded up, so that the animation covers its authored size.
+    #[serde(rename = "w", deserialize_with = "deserialize_size")]
     pub width: usize,
     /// Height of the animation
-    #[serde(rename = "h")]
+    ///
+    /// A fractional height is rounded up, like the width.
+    #[serde(rename = "h", deserialize_with = "deserialize_size")]
     pub height: usize,
     /// Whether the animation has 3D layers
     #[serde(rename = "ddd", default)]
@@ -73,6 +78,20 @@ pub struct Animation {
     // TODO: chars
     // TODO: mb
     // TODO: slots
+}
+
+fn deserialize_size<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let size = f64::deserialize(deserializer)?;
+    if size.is_finite() && size >= 0.0 {
+        Ok(size.ceil() as usize)
+    } else {
+        Err(D::Error::custom(format!(
+            "invalid size {size}: expected a finite, non-negative number"
+        )))
+    }
 }
 
 impl Animation {

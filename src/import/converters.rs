@@ -1810,4 +1810,43 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn scalar_keyframes_with_bare_numbers_and_null_handles_import() {
+        let keyframe = |t: f64, s: f64, h: u8| json!({ "t": t, "s": s, "h": h, "i": null, "o": null, "ti": null, "to": null });
+        let value = super::conv_scalar(&parse(json!({
+            "a": 0,
+            "k": [keyframe(0.0, 0.0, 1), keyframe(50.0, 100.0, 0), keyframe(100.0, 0.0, 0)],
+        })));
+        assert_eq!(value.evaluate(25.0), 0.0);
+        assert_eq!(value.evaluate(50.0), 100.0);
+        assert!(close(value.evaluate(75.0), 50.0));
+    }
+
+    #[test]
+    fn document_with_tolerated_deviations_imports_and_renders() {
+        use crate::test_support::*;
+        let mut layer = shape_layer(
+            1,
+            json!([
+                with(rect(0.0, 0.0, 10.0, 10.0), json!({ "d": 2 })),
+                fill(100.0)
+            ]),
+        );
+        // A static scalar inside an array of one number.
+        layer["ks"]["o"] = json!({ "a": 0, "k": [50] });
+        layer["ks"]["r"] = json!({ "a": 0, "k": [0] });
+        let composition = crate::Composition::from_json(json!({
+            "v": "5.7.14",
+            "fr": 60,
+            "ip": 0,
+            "op": 60,
+            "w": 99.5,
+            "h": 49.25,
+            "layers": [layer],
+        }))
+        .unwrap();
+        assert_eq!((composition.width, composition.height), (100, 50));
+        assert_eq!(trace(&composition, 0.0), ["clip", "fill(0.5)", "pop"]);
+    }
 }
