@@ -415,6 +415,29 @@ fn precomposition_clip(layer: &Layer, transform: Affine, clip_bounds: &Rect) -> 
     (!covered).then_some(bounds)
 }
 
+/// Whether a transform flattens everything into a line or a point, or comes so close to it
+/// that nothing drawn with it shows.
+///
+/// Such a transform has no inverse to speak of. One that is singular but for rounding, like a
+/// scale of zero along one axis under a quarter turn, has an inverse with coefficients of
+/// 1e30 and more, which turns the geometry of an inner group into coordinates of that size.
+fn flattens(transform: Affine) -> bool {
+    // Smallest ratio of the two scales of a transform, the least and the most that it
+    // stretches a length by, at which something is still drawn. Rounding leaves a ratio of
+    // about 1e-15 in a transform that should be singular, and a shape that is flattened to a
+    // millionth of a millionth of its size does not show at any size.
+    const FLATTEST: f64 = 1e-12;
+    let [a, b, c, d, _, _] = transform.as_coeffs();
+    // The coefficients are brought near one first, so that their products neither overflow
+    // nor vanish.
+    let largest = a.abs().max(b.abs()).max(c.abs()).max(d.abs());
+    let [a, b, c, d] = [a, b, c, d].map(|coefficient| coefficient / largest);
+    // The product of the two scales over the sum of their squares, which is their ratio as
+    // long as that is small. It is not a number for a transform that is zero or not finite.
+    let ratio = (a * d - b * c).abs() / (a * a + b * b + c * c + d * d);
+    ratio.is_nan() || ratio <= FLATTEST
+}
+
 /// Limits an opacity to the range it can be composited with. `NaN` counts as transparent.
 fn unit_alpha(alpha: f64) -> f64 {
     if alpha.is_nan() {
@@ -976,8 +999,11 @@ impl Batch {
             {
                 continue;
             }
+            // A style transform that flattens collapses both fill and stroke to zero area.
+            if flattens(draw.transform) {
+                continue;
+            }
             let style_inverse = draw.transform.inverse();
-            // A singular style transform collapses both fill and stroke to zero area.
             if !style_inverse.is_finite() {
                 continue;
             }
@@ -2162,6 +2188,156 @@ mod tests {
             panic!("expected a draw call, got {events:?}");
         };
         assert!(bounds.x0 > 1e24 && bounds.x1 < 9e24, "{bounds:?}");
+    }
+
+    /// A sink that keeps the largest coordinate of the paths it is asked to draw, as they are
+    /// handed to it, before their transform.
+    #[derive(Default)]
+    struct LargestCoordinate {
+        draws: usize,
+        largest: f64,
+    }
+
+    impl crate::RenderSink for LargestCoordinate {
+        fn push_layer(
+            &mut self,
+            _: impl Into<BlendMode>,
+            _: f32,
+            _: Affine,
+            _: &impl kurbo::Shape,
+        ) {
+        }
+        fn push_clip_layer(&mut self, _: Affine, _: &impl kurbo::Shape) {}
+        fn pop_layer(&mut self) {}
+        fn draw(
+            &mut self,
+            _: Option<&crate::model::fixed::Stroke>,
+            _: Fill,
+            _: Affine,
+            _: &crate::model::fixed::Brush,
+            shape: &impl kurbo::Shape,
+        ) {
+            let bounds = shape.bounding_box();
+            self.draws += 1;
+            self.largest = [bounds.x0, bounds.y0, bounds.x1, bounds.y1]
+                .into_iter()
+                .fold(self.largest, |largest, value| largest.max(value.abs()));
+        }
+        fn draw_image(&mut self, _: &crate::model::ImageAsset, _: Affine, _: f64) {}
+    }
+
+    /// Renders a frame at 500 sizes and returns what the sink got to draw.
+    fn draw_at_many_sizes(composition: &crate::Composition) -> LargestCoordinate {
+        let mut sink = LargestCoordinate::default();
+        for size in 1..=500 {
+            let transform = Affine::scale(f64::from(size) / 100.0);
+            crate::Renderer::new()
+                .try_append(composition, 0.0, transform, 1.0, &mut sink)
+                .unwrap();
+        }
+        sink
+    }
+
+    #[test]
+    fn style_under_a_transform_that_is_flat_but_for_rounding_draws_nothing() {
+        let ks = |scale: [f64; 2], rotation: f64| {
+            json!({
+                "a": { "a": 0, "k": [50, 50] },
+                "p": { "a": 0, "k": [50, 50] },
+                "s": { "a": 0, "k": scale },
+                "r": { "a": 0, "k": rotation },
+                "o": { "a": 0, "k": 100 },
+            })
+        };
+        // A group turned by 20 degrees, a fill that draws it from outside of the group, and
+        // eight copies of both. The fill has to bring the path of the group into its own
+        // space, by the inverse of its own transform.
+        let turned = with(
+            transform(100.0),
+            json!({ "ty": "tr", "r": { "a": 0, "k": 20 }, "p": { "a": 0, "k": [10, 0] } }),
+        );
+        let mut turning = repeater(8, 0.0, 100.0, 100.0);
+        turning["tr"]["r"] = json!({ "a": 0, "k": 45 });
+        let shapes = json!([
+            { "ty": "gr", "it": [rect(30.0, 30.0, 70.0, 40.0), stroke(100.0), turned] },
+            fill(100.0),
+            turning,
+        ]);
+        // The layer has no width, in a precomposition that is turned by a quarter. No number
+        // in the product of the two is zero, because the cosine of a quarter turn is not.
+        for scale in [[0.0, 100.0], [100.0, 0.0]] {
+            let layer = with(
+                shape_layer(1, shapes.clone()),
+                json!({ "ks": ks(scale, 0.0) }),
+            );
+            let composition = composition_with_assets(
+                json!([precomp("comp", json!([layer]))]),
+                json!([with(
+                    precomp_layer(1, "comp"),
+                    json!({ "ks": ks([50.0, 50.0], 90.0) })
+                )]),
+            );
+            let drawn = draw_at_many_sizes(&composition);
+            assert_eq!(drawn.draws, 0, "largest coordinate {:e}", drawn.largest);
+        }
+
+        // The same layer at a thousandth of its width draws, with coordinates of its own size.
+        let thin = with(
+            shape_layer(1, shapes),
+            json!({ "ks": ks([0.1, 100.0], 0.0) }),
+        );
+        let composition = composition_with_assets(
+            json!([precomp("comp", json!([thin]))]),
+            json!([with(
+                precomp_layer(1, "comp"),
+                json!({ "ks": ks([50.0, 50.0], 90.0) })
+            )]),
+        );
+        let drawn = draw_at_many_sizes(&composition);
+        assert_eq!(drawn.draws, 500 * 16);
+        assert!(drawn.largest < 200.0, "{:e}", drawn.largest);
+    }
+
+    #[test]
+    fn style_outside_a_flat_group_draws_its_collapsed_path() {
+        let flat = with(
+            transform(100.0),
+            json!({ "ty": "tr", "s": { "a": 0, "k": [0, 100] } }),
+        );
+        // Styles in the group are flattened with it. A stroke after the group is not: it
+        // draws the line that is left of the rectangle, as lottie-web does.
+        let inside = json!([
+            { "ty": "gr", "it": [rect(30.0, 30.0, 70.0, 40.0), fill(100.0), stroke(100.0), flat.clone()] },
+        ]);
+        assert_eq!(
+            trace(&composition(json!([shape_layer(1, inside)])), 0.0),
+            ["clip", "pop"]
+        );
+        let outside = json!([
+            { "ty": "gr", "it": [rect(30.0, 30.0, 70.0, 40.0), flat] },
+            stroke(100.0),
+        ]);
+        let events = render(&composition(json!([shape_layer(1, outside)])), 0.0, 1.0);
+        assert_eq!(draw_bounds(&events), [Rect::new(0.0, 30.0, 0.0, 40.0)]);
+    }
+
+    #[test]
+    fn skew_by_a_quarter_turn_draws_nothing() {
+        // The tangent of a quarter turn is about 1e16, which shears every shape to 1e16 times
+        // its height.
+        let sheared = with(
+            shape_layer(1, json!([rect(30.0, 30.0, 70.0, 40.0), fill(100.0)])),
+            json!({ "ks": with(transform(100.0), json!({ "sk": { "a": 0, "k": 90 }, "sa": { "a": 0, "k": 30 } })) }),
+        );
+        assert_eq!(trace(&composition(json!([sheared])), 0.0), ["clip", "pop"]);
+        let slanted = with(
+            shape_layer(1, json!([rect(30.0, 30.0, 70.0, 40.0), fill(100.0)])),
+            json!({ "ks": with(transform(100.0), json!({ "sk": { "a": 0, "k": 60 }, "sa": { "a": 0, "k": 30 } })) }),
+        );
+        assert_eq!(
+            trace(&composition(json!([slanted])), 0.0),
+            ["clip", "fill(1)", "pop"]
+        );
     }
 
     /// A square path that grows from a side of 20 to a side of 80 between frames 0 and 40,
