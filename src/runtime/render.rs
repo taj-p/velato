@@ -425,10 +425,12 @@ struct DrawData {
     transform: Affine,
     /// Range into `ShapeBatch::geometries`
     geometry: Range<usize>,
-    // Only repeaters that copied this style may share its opacity layers with other styles.
-    repeater_depth: usize,
     /// Translucent groups that hold this style and repeater copies that include it, outermost
     /// first. The opacity of each applies to everything inside it at once.
+    ///
+    /// A copy that only repeats the geometry of a style, because the style comes after the
+    /// repeater, is not among them: the style draws the geometry of all copies as one path,
+    /// and the opacity of a copy applies to the styles that the copy holds.
     scopes: Vec<OpacityScope>,
 }
 
@@ -444,7 +446,6 @@ impl DrawData {
             alpha: unit_alpha(draw.opacity.evaluate(frame) / 100.0),
             transform: Affine::IDENTITY,
             geometry,
-            repeater_depth: 0,
             scopes: Vec::new(),
         }
     }
@@ -457,20 +458,6 @@ struct GeometryData {
     transform: Affine,
     // Sequential trimming follows copy indices independently of paint stacking.
     trim_order: usize,
-    // Inherited styles need copy opacity without inheriting the repeated styles' stacking position.
-    copies: Vec<OpacityScope>,
-}
-
-impl GeometryData {
-    fn opacity_copies(&self) -> &[OpacityScope] {
-        // Opaque ancestors still distinguish separate instances of translucent descendants.
-        let end = self
-            .copies
-            .iter()
-            .rposition(|copy| copy.alpha != 1.0)
-            .map_or(0, |index| index + 1);
-        &self.copies[..end]
-    }
 }
 
 /// A shape group or repeater copy whose opacity applies to its content as a whole.
@@ -480,23 +467,13 @@ struct OpacityScope {
     alpha: f64,
 }
 
-/// One call to [`RenderSink::draw`]: a style and a run of its geometry in the same repeater
-/// copies.
-#[derive(Clone, Debug)]
-struct DrawCall {
-    /// Index into `Batch::draws`
-    draw: usize,
-    /// Range into `Batch::geometries`
-    geometries: Range<usize>,
-}
-
 #[derive(Debug, Default)]
 struct Batch {
     elements: Vec<PathEl>,
     geometries: Vec<GeometryData>,
     draws: Vec<DrawData>,
-    /// Draw calls in paint order.
-    calls: Vec<DrawCall>,
+    /// Indices into `draws` of the styles that make a draw call, in paint order.
+    calls: Vec<usize>,
     repeat_geometries: Vec<GeometryData>,
     repeat_draws: Vec<DrawData>,
     next_scope: usize,
@@ -610,7 +587,6 @@ impl Batch {
             elements: start..end,
             transform,
             trim_order: self.geometries.len(),
-            copies: Vec::new(),
         });
     }
 
@@ -663,12 +639,10 @@ impl Batch {
                 RepeaterComposite::Above => copy,
             };
             let transform = repeater.transform(i);
-            let copy_layer = copy_scope(copy, i);
             for geometry in &self.repeat_geometries {
                 let mut geometry = geometry.clone();
                 geometry.trim_order += i * geometry_count;
                 geometry.transform = transform * geometry.transform;
-                geometry.copies.insert(0, copy_layer);
                 self.geometries.push(geometry);
             }
         }
@@ -686,7 +660,6 @@ impl Batch {
                 let end = draw.geometry.end - geometry_start;
                 draw.geometry = copy_start + start..copy_start + end;
                 draw.transform = transform * draw.transform;
-                draw.repeater_depth += 1;
                 // The copy holds the styles it repeats, along with any groups inside it.
                 draw.scopes.insert(0, copy_scope(copy, i));
                 self.draws.push(draw);
@@ -772,7 +745,7 @@ impl Batch {
         self.trim_elements.clear();
     }
 
-    /// Lists the draw calls in paint order, leaving out those that would draw nothing.
+    /// Lists the styles that make a draw call, in paint order.
     fn collect_calls(&mut self) {
         for (draw_index, draw) in self.draws.iter().enumerate().rev() {
             if draw.alpha <= 0.0
@@ -786,31 +759,15 @@ impl Batch {
             if !style_inverse.is_finite() {
                 continue;
             }
-            let mut start = draw.geometry.start;
-            // Compound paths must be assembled after group transforms and modifiers are resolved.
-            for geometries in self.geometries[draw.geometry.clone()]
-                .chunk_by(|a, b| a.opacity_copies() == b.opacity_copies())
-            {
-                let range = start..start + geometries.len();
-                start = range.end;
-                if geometries[0]
-                    .opacity_copies()
-                    .iter()
-                    .any(|copy| copy.alpha <= 0.0)
-                {
-                    continue;
-                }
-                let has_path = geometries.iter().any(|geometry| {
+            let has_path = self.geometries[draw.geometry.clone()]
+                .iter()
+                .any(|geometry| {
                     !geometry.elements.is_empty()
                         && (geometry.transform == draw.transform
                             || (style_inverse * geometry.transform).is_finite())
                 });
-                if has_path {
-                    self.calls.push(DrawCall {
-                        draw: draw_index,
-                        geometries: range,
-                    });
-                }
+            if has_path {
+                self.calls.push(draw_index);
             }
         }
     }
@@ -820,30 +777,10 @@ impl Batch {
         self.calls.len()
     }
 
-    /// Opacity scopes around a draw call, outermost first: those of the style, then the repeater
-    /// copies of the geometry that did not copy the style itself.
-    fn scopes(&self, call: &DrawCall) -> (&[OpacityScope], &[OpacityScope]) {
-        let draw = &self.draws[call.draw];
-        let copies = self.geometries[call.geometries.start].opacity_copies();
-        (
-            &draw.scopes,
-            &copies[draw.repeater_depth.min(copies.len())..],
-        )
-    }
-
-    /// Number of opacity scopes, counted from the outermost, that hold both draw calls.
-    fn shared_scopes(&self, a: &DrawCall, b: &DrawCall) -> usize {
-        fn common(a: &[OpacityScope], b: &[OpacityScope]) -> usize {
-            a.iter().zip(b).take_while(|(a, b)| a == b).count()
-        }
-        let (a_style, a_copies) = self.scopes(a);
-        let (b_style, b_copies) = self.scopes(b);
-        if a.draw == b.draw {
-            a_style.len() + common(a_copies, b_copies)
-        } else {
-            // Copies that did not copy the style belong to that style alone.
-            common(a_style, b_style)
-        }
+    /// Number of opacity scopes, counted from the outermost, that hold both styles.
+    fn shared_scopes(&self, a: usize, b: usize) -> usize {
+        let (a, b) = (&self.draws[a].scopes, &self.draws[b].scopes);
+        a.iter().zip(b).take_while(|(a, b)| a == b).count()
     }
 
     /// Emits the draw calls. `alpha` is opacity of the layer that is left to the brushes.
@@ -856,15 +793,13 @@ impl Batch {
         // Scopes shared with the previous draw call are open layers.
         let mut shared_previous = 0;
         for (index, call) in self.calls.iter().enumerate() {
-            let draw = &self.draws[call.draw];
-            let (style_scopes, copy_scopes) = self.scopes(call);
-            let scopes = || style_scopes.iter().chain(copy_scopes).enumerate();
+            let draw = &self.draws[*call];
             let shared_next = self
                 .calls
                 .get(index + 1)
-                .map_or(0, |next| self.shared_scopes(call, next));
+                .map_or(0, |next| self.shared_scopes(*call, *next));
             let mut brush_alpha = alpha * draw.alpha;
-            for (depth, scope) in scopes().skip(shared_previous) {
+            for (depth, scope) in draw.scopes.iter().enumerate().skip(shared_previous) {
                 if scope.alpha == 1.0 {
                     continue;
                 }
@@ -874,15 +809,16 @@ impl Batch {
                     brush_alpha *= scope.alpha;
                 }
             }
+            // Compound paths must be assembled after group transforms and modifiers are resolved.
             self.render_draw(
                 draw,
                 brush_alpha,
-                &self.geometries[call.geometries.clone()],
+                &self.geometries[draw.geometry.clone()],
                 &mut path,
                 scene,
             );
             let open = shared_previous.max(shared_next);
-            for (_, scope) in scopes().take(open).skip(shared_next) {
+            for scope in draw.scopes.iter().take(open).skip(shared_next) {
                 if scope.alpha != 1.0 {
                     scene.pop_layer();
                 }
@@ -1562,11 +1498,13 @@ mod tests {
     }
 
     #[test]
-    fn style_after_a_repeater_takes_the_opacity_of_each_copy() {
+    fn style_after_a_repeater_does_not_take_the_opacity_of_its_copies() {
+        // The copies fade out, but hold no style. The fill after the repeater draws the
+        // rectangle of every copy, the transparent one included, as one path.
         let shapes = json!([
             rect(0.0, 0.0, 10.0, 10.0),
-            repeater(2, 20.0, 100.0, 50.0),
-            fill(100.0),
+            repeater(3, 20.0, 100.0, 0.0),
+            fill(80.0),
         ]);
         let events = render(&composition(json!([shape_layer(1, shapes)])), 0.0, 1.0);
         let draws: Vec<_> = events
@@ -1576,14 +1514,23 @@ mod tests {
                 _ => None,
             })
             .collect();
+        assert_eq!(draws, [(0.8, Rect::new(0.0, 0.0, 50.0, 10.0))]);
+        assert_eq!(events.len(), 5, "no layer is pushed");
+    }
+
+    #[test]
+    fn styles_inside_and_after_a_repeater_take_their_own_opacity() {
+        // The stroke is repeated and fades with its copy. The fill is not.
+        let shapes = json!([
+            rect(0.0, 0.0, 10.0, 10.0),
+            stroke(100.0),
+            repeater(2, 20.0, 100.0, 50.0),
+            fill(100.0),
+        ]);
         assert_eq!(
-            draws,
-            [
-                (0.5, Rect::new(20.0, 0.0, 30.0, 10.0)),
-                (1.0, Rect::new(0.0, 0.0, 10.0, 10.0)),
-            ]
+            trace(&composition(json!([shape_layer(1, shapes)])), 0.0),
+            ["clip", "fill(1)", "stroke(0.5)", "stroke(1)", "pop"]
         );
-        assert_eq!(events.len(), 6, "no layer is pushed for a single draw call");
     }
 
     #[test]
