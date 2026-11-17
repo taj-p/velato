@@ -2216,4 +2216,154 @@ mod tests {
             Event::PushLayer { bounds, .. } if *bounds == Rect::new(0.0, 0.0, 40.0, 30.0)
         ));
     }
+
+    fn positioned(layer: serde_json::Value, x: f64, y: f64) -> serde_json::Value {
+        let mut layer = layer;
+        layer["ks"]["p"] = json!({ "a": 0, "k": [x, y] });
+        layer
+    }
+
+    #[test]
+    fn solid_layer_draws_a_rectangle_in_the_layer_transform() {
+        let composition = composition(json!([positioned(
+            solid_layer(1, 40.0, 30.0, "#ff8000"),
+            10.0,
+            20.0
+        )]));
+        assert_eq!(
+            render(&composition, 0.0, 1.0),
+            [
+                Event::PushClip(Rect::new(0.0, 0.0, 100.0, 100.0)),
+                Event::BeginLayer("layer 1".into()),
+                Event::Draw {
+                    stroked: false,
+                    alpha: 1.0,
+                    bounds: Rect::new(10.0, 20.0, 50.0, 50.0),
+                },
+                Event::EndLayer,
+                Event::Pop,
+            ]
+        );
+    }
+
+    #[test]
+    fn translucent_solid_layer_fades_its_brush() {
+        // A solid is a single draw call, so its opacity needs no layer.
+        let solid = with(solid_layer(1, 40.0, 30.0, "#ff8000"), opacity(50.0));
+        assert_eq!(
+            trace(&composition(json!([solid])), 0.0),
+            ["clip", "fill(0.5)", "pop"]
+        );
+        // The alpha of the color itself is kept as well.
+        let translucent_color = with(solid_layer(1, 40.0, 30.0, "#ff800080"), opacity(50.0));
+        let events = render(&composition(json!([translucent_color])), 0.0, 1.0);
+        let Event::Draw { alpha, .. } = &events[2] else {
+            panic!("expected a draw call, got {events:?}");
+        };
+        assert!((alpha - 0.25).abs() < 0.005, "{alpha}");
+    }
+
+    #[test]
+    fn solid_layer_can_be_a_track_matte_source_and_a_matted_layer() {
+        let shape = |ind| shape_layer(ind, json!([rect(0.0, 0.0, 20.0, 20.0), fill(100.0)]));
+        let matte = [
+            "clip",
+            "layer(1)",
+            "fill(1)",
+            "layer(1, SrcIn)",
+            "fill(1)",
+            "pop",
+            "pop",
+            "pop",
+        ];
+        let bounds = |events: &[Event]| draw_bounds(events);
+
+        // The solid is the matte of the shape layer below it.
+        let solid_source = composition(json!([
+            with(solid_layer(1, 40.0, 30.0, "#ffffff"), json!({ "td": 1 })),
+            with(shape(2), json!({ "tt": 1 })),
+        ]));
+        assert_eq!(trace(&solid_source, 0.0), matte);
+        assert_eq!(
+            bounds(&render(&solid_source, 0.0, 1.0)),
+            [
+                Rect::new(0.0, 0.0, 40.0, 30.0),
+                Rect::new(0.0, 0.0, 20.0, 20.0)
+            ]
+        );
+
+        // The solid is matted by the shape layer above it.
+        let solid_matted = composition(json!([
+            with(shape(1), json!({ "td": 1 })),
+            with(solid_layer(2, 40.0, 30.0, "#ffffff"), json!({ "tt": 1 })),
+        ]));
+        assert_eq!(trace(&solid_matted, 0.0), matte);
+        assert_eq!(
+            bounds(&render(&solid_matted, 0.0, 1.0)),
+            [
+                Rect::new(0.0, 0.0, 20.0, 20.0),
+                Rect::new(0.0, 0.0, 40.0, 30.0)
+            ]
+        );
+    }
+
+    #[test]
+    fn solid_layer_takes_masks_blend_mode_range_and_parenting() {
+        let mask = json!({
+            "mode": "a",
+            "o": { "a": 0, "k": 100 },
+            "pt": {
+                "a": 0,
+                "k": {
+                    "c": true,
+                    "v": [[0, 0], [20, 0], [20, 20], [0, 20]],
+                    "i": [[0, 0], [0, 0], [0, 0], [0, 0]],
+                    "o": [[0, 0], [0, 0], [0, 0], [0, 0]],
+                },
+            },
+        });
+        let masked = with(
+            solid_layer(1, 40.0, 30.0, "#ff8000"),
+            json!({ "masksProperties": [mask] }),
+        );
+        assert_eq!(
+            trace(&composition(json!([masked])), 0.0),
+            ["clip", "clip", "fill(1)", "pop", "pop"]
+        );
+
+        let blended = with(solid_layer(1, 40.0, 30.0, "#ff8000"), json!({ "bm": 1 }));
+        assert_eq!(
+            trace(&composition(json!([blended])), 0.0),
+            ["layer(1)", "layer(1, Multiply)", "fill(1)", "pop", "pop"]
+        );
+
+        let ranged = with(
+            solid_layer(1, 40.0, 30.0, "#ff8000"),
+            json!({ "ip": 10, "op": 20 }),
+        );
+        let ranged = composition(json!([ranged]));
+        assert_eq!(trace(&ranged, 9.0), ["clip", "pop"]);
+        assert_eq!(trace(&ranged, 10.0), ["clip", "fill(1)", "pop"]);
+        assert_eq!(trace(&ranged, 20.0), ["clip", "pop"]);
+
+        // A solid follows its parent, and a layer parented to a solid follows the solid.
+        let family = composition(json!([
+            with(
+                shape_layer(1, json!([rect(0.0, 0.0, 5.0, 5.0), fill(100.0)])),
+                json!({ "parent": 2 }),
+            ),
+            with(
+                positioned(solid_layer(2, 10.0, 10.0, "#ff8000"), 1.0, 2.0),
+                json!({ "parent": 3 }),
+            ),
+            positioned(layer(3, 3), 30.0, 40.0),
+        ]));
+        assert_eq!(
+            draw_bounds(&render(&family, 0.0, 1.0)),
+            [
+                Rect::new(31.0, 42.0, 41.0, 52.0),
+                Rect::new(31.0, 42.0, 36.0, 47.0)
+            ]
+        );
+    }
 }

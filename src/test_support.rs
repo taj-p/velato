@@ -249,6 +249,14 @@ pub(crate) fn shape_layer(ind: u32, shapes: Value) -> Value {
     with(layer(4, ind), json!({ "shapes": shapes }))
 }
 
+/// A solid layer of the given size and color.
+pub(crate) fn solid_layer(ind: u32, width: f64, height: f64, color: &str) -> Value {
+    with(
+        layer(1, ind),
+        json!({ "sw": width, "sh": height, "sc": color }),
+    )
+}
+
 /// A precomposition layer that instances the asset `ref_id`.
 pub(crate) fn precomp_layer(ind: u32, ref_id: &str) -> Value {
     with(

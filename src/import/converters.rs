@@ -161,7 +161,11 @@ pub fn conv_layer(source: &AnyLayer) -> Option<(Layer, usize, Option<BlendMode>,
             params
         }
         AnyLayer::Solid(solid_color_layer) => {
-            setup_layer_base(&solid_color_layer.visual_layer, &mut layer)
+            let params = setup_layer_base(&solid_color_layer.visual_layer, &mut layer);
+            layer.width = solid_color_layer.width;
+            layer.height = solid_color_layer.height;
+            layer.content = Content::Shape(conv_solid(solid_color_layer));
+            params
         }
         AnyLayer::Image(image_layer) => {
             let params = setup_layer_base(&image_layer.visual_layer, &mut layer);
@@ -208,6 +212,33 @@ pub fn conv_layer(source: &AnyLayer) -> Option<(Layer, usize, Option<BlendMode>,
     } = params;
 
     Some((layer, id, matte_mode, matte_layer_index))
+}
+
+/// Converts a solid layer to the shapes that draw it: a rectangle of the layer's size with its
+/// corner at the layer's origin, filled with the layer's color.
+///
+/// As shapes, a solid takes the layer's transform, opacity, masks, mattes and blend mode the
+/// way a shape layer does.
+fn conv_solid(solid: &schema::layers::solid::SolidLayer) -> Vec<model::Shape> {
+    use kurbo::Shape as _;
+    let (width, height) = (solid.width, solid.height);
+    // A rectangle without a positive size is not drawn.
+    if !(width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0) {
+        return Vec::new();
+    }
+    // The color is a CSS color, which exporters write as `#rrggbb`. One that does not parse is
+    // black, which is what an SVG fill falls back to.
+    let color = peniko::color::parse_color(solid.color.trim())
+        .map_or(Color::BLACK, |color| color.to_alpha_color());
+    let rect = kurbo::Rect::new(0.0, 0.0, width, height);
+    vec![
+        model::Shape::Geometry(model::Geometry::Fixed(rect.path_elements(0.1).collect())),
+        model::Shape::Draw(Draw {
+            stroke: None,
+            brush: model::Brush::Fixed(color.into()),
+            opacity: Value::Fixed(100.0),
+        }),
+    ]
 }
 
 fn conv_layer_effect(effect: &serde_json::Value) -> Option<model::LayerEffect> {
@@ -1848,5 +1879,71 @@ mod tests {
         .unwrap();
         assert_eq!((composition.width, composition.height), (100, 50));
         assert_eq!(trace(&composition, 0.0), ["clip", "fill(0.5)", "pop"]);
+    }
+
+    /// The color of the only fill of a layer that was imported with fixed shapes.
+    fn fill_color(layer: &model::Layer) -> [f32; 4] {
+        let Content::Shape(shapes) = &layer.content else {
+            panic!("expected shapes");
+        };
+        let brush = shapes
+            .iter()
+            .find_map(|shape| match shape {
+                model::Shape::Draw(draw) => Some(draw.brush.evaluate(1.0, 0.0).into_owned()),
+                _ => None,
+            })
+            .expect("expected a fill");
+        let peniko::Brush::Solid(color) = brush else {
+            panic!("expected a solid color");
+        };
+        color.components
+    }
+
+    #[test]
+    fn solid_layer_imports_as_a_filled_rectangle_of_its_size() {
+        use crate::test_support::*;
+        let composition = composition(json!([solid_layer(1, 40.0, 30.0, "#ff8000")]));
+        let layer = &composition.layers[0];
+        assert_eq!((layer.width, layer.height), (40.0, 30.0));
+        let [red, green, blue, alpha] = fill_color(layer);
+        assert_eq!((red, blue, alpha), (1.0, 0.0, 1.0));
+        assert!((green - 128.0 / 255.0).abs() < 1e-6);
+        assert_eq!(
+            render(&composition, 0.0, 1.0)[2],
+            Event::Draw {
+                stroked: false,
+                alpha: 1.0,
+                bounds: kurbo::Rect::new(0.0, 0.0, 40.0, 30.0),
+            }
+        );
+    }
+
+    #[test]
+    fn solid_color_is_read_as_a_css_color() {
+        use crate::test_support::*;
+        let color = |text: &str| {
+            let composition = composition(json!([solid_layer(1, 10.0, 10.0, text)]));
+            fill_color(&composition.layers[0]).map(|component| (component * 255.0).round() as u8)
+        };
+        assert_eq!(color("#ff8000"), [255, 128, 0, 255]);
+        assert_eq!(color("#FF8000"), [255, 128, 0, 255]);
+        assert_eq!(color("#f80"), [255, 136, 0, 255]);
+        assert_eq!(color("#ff800080"), [255, 128, 0, 128]);
+        assert_eq!(color("red"), [255, 0, 0, 255]);
+        assert_eq!(color("rgb(255, 128, 0)"), [255, 128, 0, 255]);
+        assert_eq!(color(" #ff8000 "), [255, 128, 0, 255]);
+        // A color that does not parse is black.
+        assert_eq!(color("ff8000"), [0, 0, 0, 255]);
+        assert_eq!(color("no color"), [0, 0, 0, 255]);
+        assert_eq!(color(""), [0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn solid_layer_without_a_positive_size_draws_nothing() {
+        use crate::test_support::*;
+        for (width, height) in [(0.0, 10.0), (10.0, 0.0), (-5.0, 10.0)] {
+            let composition = composition(json!([solid_layer(1, width, height, "#ff8000")]));
+            assert_eq!(trace(&composition, 0.0), ["clip", "pop"]);
+        }
     }
 }
