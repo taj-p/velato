@@ -106,9 +106,28 @@ pub struct Time {
     pub out_tangent: Option<EasingHandle>,
     /// Whether it's a hold frame.
     pub hold: bool,
+    /// Easing of the second, third and fourth dimension of the value, for a keyframe that
+    /// eases the dimensions of its value separately. A dimension without easing of its own is
+    /// eased like the first, with `in_tangent` and `out_tangent`.
+    pub dimension_easings: [Option<Easing>; 3],
 }
 
 impl Time {
+    /// Returns the easing from this keyframe to the next. Without tangents it is linear.
+    fn easing(&self) -> Easing {
+        Easing {
+            o: self.out_tangent.unwrap_or(Easing::LERP.o),
+            i: self.in_tangent.unwrap_or(Easing::LERP.i),
+        }
+    }
+
+    /// Returns the easing of each of the first four dimensions of the value.
+    fn easings(&self) -> [Easing; 4] {
+        let first = self.easing();
+        let [second, third, fourth] = self.dimension_easings.map(|easing| easing.unwrap_or(first));
+        [first, second, third, fourth]
+    }
+
     /// Returns the frame indices and interpolation weight for the given frame,
     /// and whether to hold the frame
     pub(crate) fn frames_and_weight(
@@ -128,12 +147,7 @@ impl Time {
 
         let t0 = times[ix0];
         let t1 = times[ix1];
-        let (t0_ox, t0_oy) = t0.out_tangent.map(|o| (o.x, o.y)).unwrap_or((0.0, 0.0));
-        let (t0_ix, t0_iy) = t0.in_tangent.map(|i| (i.x, i.y)).unwrap_or((1.0, 1.0));
-        let easing = Easing {
-            o: EasingHandle { x: t0_ox, y: t0_oy },
-            i: EasingHandle { x: t0_ix, y: t0_iy },
-        };
+        let easing = t0.easing();
         let hold = t0.hold;
         // Keyframes that are out of order can still leave a span without length, which has no
         // position to interpolate at.
@@ -160,19 +174,25 @@ impl<T: Tween> Animated<T> {
     }
 
     fn evaluate_inner(&self, frame: f64) -> Option<T> {
-        let ([ix0, ix1], t, easing, hold) = Time::frames_and_weight(&self.times, frame)?;
+        let ([ix0, ix1], t, _, hold) = Time::frames_and_weight(&self.times, frame)?;
         let t = if hold { 0.0 } else { t };
 
         let v1 = self.values.get(ix0)?;
         let v2 = self.values.get(ix1)?;
 
-        Some(v1.tween(v2, t, &easing))
+        Some(v1.tween_each(v2, t, &self.times[ix0].easings()))
     }
 }
 
 /// Something that can be interpolated with an easing function.
 pub trait Tween: Clone {
     fn tween(&self, other: &Self, t: f64, easing: &Easing) -> Self;
+
+    /// Tweens each dimension of the value with an easing of its own. A value of one dimension
+    /// takes the first.
+    fn tween_each(&self, other: &Self, t: f64, easings: &[Easing; 4]) -> Self {
+        self.tween(other, t, &easings[0])
+    }
 }
 
 impl Tween for f64 {
@@ -240,6 +260,13 @@ impl Tween for kurbo::Point {
             self.y.tween(&other.y, t, easing),
         )
     }
+
+    fn tween_each(&self, other: &Self, t: f64, easings: &[Easing; 4]) -> Self {
+        Self::new(
+            self.x.tween(&other.x, t, &easings[0]),
+            self.y.tween(&other.y, t, &easings[1]),
+        )
+    }
 }
 
 impl Tween for kurbo::Vec2 {
@@ -249,6 +276,13 @@ impl Tween for kurbo::Vec2 {
             self.y.tween(&other.y, t, easing),
         )
     }
+
+    fn tween_each(&self, other: &Self, t: f64, easings: &[Easing; 4]) -> Self {
+        Self::new(
+            self.x.tween(&other.x, t, &easings[0]),
+            self.y.tween(&other.y, t, &easings[1]),
+        )
+    }
 }
 
 impl Tween for kurbo::Size {
@@ -256,6 +290,13 @@ impl Tween for kurbo::Size {
         Self::new(
             self.width.tween(&other.width, t, easing),
             self.height.tween(&other.height, t, easing),
+        )
+    }
+
+    fn tween_each(&self, other: &Self, t: f64, easings: &[Easing; 4]) -> Self {
+        Self::new(
+            self.width.tween(&other.width, t, &easings[0]),
+            self.height.tween(&other.height, t, &easings[1]),
         )
     }
 }
@@ -269,5 +310,13 @@ impl Tween for peniko::Color {
         let b = (b1 as f64).tween(&(b2 as f64), t, easing);
         let a = (a1 as f64).tween(&(a2 as f64), t, easing);
         peniko::Color::new([r as f32, g as f32, b as f32, a as f32])
+    }
+
+    fn tween_each(&self, other: &Self, t: f64, easings: &[Easing; 4]) -> Self {
+        let mut components = self.components;
+        for ((component, to), easing) in components.iter_mut().zip(other.components).zip(easings) {
+            *component = f64::from(*component).tween(&f64::from(to), t, easing) as f32;
+        }
+        peniko::Color::new(components)
     }
 }

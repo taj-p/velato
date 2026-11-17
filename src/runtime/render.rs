@@ -2395,6 +2395,99 @@ mod tests {
     }
 
     #[test]
+    fn dimensions_of_a_value_are_eased_separately() {
+        // The size of a rectangle goes from 20 to 80 between frames 0 and 40. Its width starts
+        // slowly and its height quickly.
+        let size = |easing: serde_json::Value| {
+            json!({
+                "a": 1,
+                "k": [
+                    with(json!({ "t": 0, "s": [20, 20] }), easing),
+                    { "t": 40, "s": [80, 80] },
+                ],
+            })
+        };
+        let size_at = |easing: serde_json::Value, frame: f64| {
+            let shapes = json!([
+                with(rect(0.0, 0.0, 10.0, 10.0), json!({ "s": size(easing) })),
+                fill(100.0),
+            ]);
+            let events = render(&composition(json!([shape_layer(1, shapes)])), frame, 1.0);
+            let [bounds] = draw_bounds(&events)[..] else {
+                panic!("expected one draw call, got {events:?}");
+            };
+            (bounds.width(), bounds.height())
+        };
+        let near = |(width, height): (f64, f64), expected: (f64, f64)| {
+            assert!(
+                (width - expected.0).abs() < 0.05 && (height - expected.1).abs() < 0.05,
+                "{width} by {height}, expected {expected:?}"
+            );
+        };
+        let separate = json!({
+            "o": { "x": [0.9, 0.1], "y": [0, 0] },
+            "i": { "x": [0.1, 0.9], "y": [1, 1] },
+        });
+        near(size_at(separate.clone(), 10.0), (22.2, 33.5));
+        near(size_at(separate.clone(), 30.0), (77.8, 66.5));
+        assert_eq!(size_at(separate.clone(), 0.0), (20.0, 20.0));
+        assert_eq!(size_at(separate, 40.0), (80.0, 80.0));
+        // A dimension that a handle has no value for takes the first, value by value.
+        let first_only = json!({ "o": { "x": [0.9], "y": [0] }, "i": { "x": [0.1], "y": [1] } });
+        near(size_at(first_only, 10.0), (22.2, 22.2));
+        let scalar = json!({ "o": { "x": 0.9, "y": 0 }, "i": { "x": 0.1, "y": 1 } });
+        near(size_at(scalar, 10.0), (22.2, 22.2));
+        let mixed = json!({ "o": { "x": [0.9, 0.1], "y": [0] }, "i": { "x": [0.1, 0.9], "y": 1 } });
+        near(size_at(mixed, 10.0), (22.2, 33.5));
+
+        // The scale of a layer, which has two dimensions as well.
+        let scale = |frame: f64| {
+            let scaled = with(
+                shape_layer(1, json!([rect(0.0, 0.0, 100.0, 100.0), fill(100.0)])),
+                json!({ "ks": with(transform(100.0), json!({ "s": size(json!({
+                    "o": { "x": [0.9, 0.1], "y": [0, 0] },
+                    "i": { "x": [0.1, 0.9], "y": [1, 1] },
+                })) })) }),
+            );
+            let events = render(&composition(json!([scaled])), frame, 1.0);
+            let bounds = draw_bounds(&events)[0];
+            (bounds.width(), bounds.height())
+        };
+        near(scale(10.0), (22.2, 33.5));
+    }
+
+    #[test]
+    fn value_of_one_dimension_takes_the_first_easing() {
+        // A handle with two values on an opacity. Only the first can apply.
+        let fading = json!({
+            "a": 1,
+            "k": [
+                {
+                    "t": 0,
+                    "s": [0],
+                    "o": { "x": [0.9, 0.1], "y": [0, 0] },
+                    "i": { "x": [0.1, 0.9], "y": [1, 1] },
+                },
+                { "t": 40, "s": [100] },
+            ],
+        });
+        let shapes = json!([
+            rect(0.0, 0.0, 10.0, 10.0),
+            with(fill(100.0), json!({ "o": fading })),
+        ]);
+        let composition = composition(json!([shape_layer(1, shapes)]));
+        let events = render(&composition, 10.0, 1.0);
+        let Some(Event::Draw { alpha, .. }) = events
+            .iter()
+            .find(|event| matches!(event, Event::Draw { .. }))
+        else {
+            panic!("expected a draw call, got {events:?}");
+        };
+        // 3.7 % of the way, as with the first easing, and not 22.5 %, as with the second.
+        assert!((alpha - 0.037).abs() < 0.001, "{alpha}");
+    }
+
+    #[test]
     fn mask_path_keyframes_are_eased() {
         let slow = json!({ "o": { "x": [0.9], "y": [0] }, "i": { "x": [0.1], "y": [1] } });
         let masked = with(

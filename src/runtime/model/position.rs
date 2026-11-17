@@ -203,6 +203,7 @@ mod tests {
                 in_tangent: None,
                 out_tangent: None,
                 hold: false,
+                dimension_easings: [None; 3],
             },
             value,
             out_tangent: Some(tangent),

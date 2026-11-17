@@ -555,30 +555,20 @@ pub fn conv_keyframes<'a, T: Tween>(
     let mut frames = vec![];
     let mut values = vec![];
 
-    let collect_tangents = |handle: &Option<KeyframeBezierHandle>| {
-        let mut handles = vec![];
-        let Some(handle) = handle else { return handles };
-
-        match (&handle.x_coordinate, &handle.y_coordinate) {
-            (KeyframeComponent::ArrayOfValues(xarr), KeyframeComponent::ArrayOfValues(yarr)) => {
-                handles.extend(
-                    xarr.iter()
-                        .take(2)
-                        .zip(yarr.iter().take(2))
-                        .map(|(x, y)| EasingHandle { x: *x, y: *y }),
-                );
-            }
-            (KeyframeComponent::ArrayOfValues(xarr), KeyframeComponent::SingleValue(y)) => {
-                handles.extend(xarr.iter().take(2).map(|x| EasingHandle { x: *x, y: *y }));
-            }
-            (KeyframeComponent::SingleValue(x), KeyframeComponent::ArrayOfValues(yarr)) => {
-                handles.extend(yarr.iter().take(2).map(|y| EasingHandle { x: *x, y: *y }));
-            }
-            (KeyframeComponent::SingleValue(x), KeyframeComponent::SingleValue(y)) => {
-                handles.push(EasingHandle { x: *x, y: *y });
-            }
-        }
-        handles
+    // A handle may hold a value for each dimension of the property, which are then eased
+    // separately. A dimension that a handle has no value for takes the first.
+    let component = |component: &KeyframeComponent, dimension: usize| match component {
+        KeyframeComponent::SingleValue(value) => Some((*value, dimension == 0)),
+        KeyframeComponent::ArrayOfValues(values) => values
+            .get(dimension)
+            .map(|value| (*value, true))
+            .or_else(|| Some((*values.first()?, dimension == 0))),
+    };
+    // Returns the handle for a dimension, and whether it has a value of its own for it.
+    let handle = |handle: &KeyframeBezierHandle, dimension: usize| {
+        let (x, own_x) = component(&handle.x_coordinate, dimension)?;
+        let (y, own_y) = component(&handle.y_coordinate, dimension)?;
+        Some((EasingHandle { x, y }, own_x || own_y))
     };
 
     for (keyframe, start_value) in keyframes.into_iter().zip(start_values) {
@@ -588,28 +578,21 @@ pub fn conv_keyframes<'a, T: Tween>(
             .as_ref()
             .map(|b| b.eq(&BoolInt::True))
             .unwrap_or(false);
-        let in_tangents = collect_tangents(&keyframe.base.in_tangent);
-        let out_tangents = collect_tangents(&keyframe.base.out_tangent);
-        let tangents: Vec<_> = in_tangents.into_iter().zip(out_tangents).collect();
-        if tangents.is_empty() {
-            frames.push(Time {
-                frame: keyframe.base.time,
-                in_tangent: None,
-                out_tangent: None,
-                hold,
-            });
-            values.push(f(start_value));
-        } else {
-            for (in_tangent, out_tangent) in tangents {
-                frames.push(Time {
-                    frame: keyframe.base.time,
-                    in_tangent: Some(in_tangent),
-                    out_tangent: Some(out_tangent),
-                    hold,
-                });
-                values.push(f(start_value));
-            }
-        }
+        let easing = |dimension: usize| {
+            let (i, own_in) = handle(keyframe.base.in_tangent.as_ref()?, dimension)?;
+            let (o, own_out) = handle(keyframe.base.out_tangent.as_ref()?, dimension)?;
+            Some((Easing { o, i }, own_in || own_out))
+        };
+        let first = easing(0).map(|(easing, _)| easing);
+        frames.push(Time {
+            frame: keyframe.base.time,
+            in_tangent: first.map(|easing| easing.i),
+            out_tangent: first.map(|easing| easing.o),
+            hold,
+            dimension_easings: [1, 2, 3]
+                .map(|dimension| easing(dimension).and_then(|(easing, own)| own.then_some(easing))),
+        });
+        values.push(f(start_value));
     }
     Value::Animated(runtime::model::Animated {
         times: frames,
@@ -683,6 +666,7 @@ fn conv_gradient_colors(
                         .as_ref()
                         .and_then(conv_keyframe_handle),
                     hold,
+                    dimension_easings: [None; 3],
                 });
 
                 let stops = conv_stops(start_value, count)
@@ -1106,6 +1090,7 @@ pub fn conv_shape_geometry(
                         .as_ref()
                         .and_then(conv_keyframe_handle),
                     hold,
+                    dimension_easings: [None; 3],
                 });
                 // Get converted spline points for keyframe bezier at the start
                 let start_bezier = {
@@ -1226,6 +1211,7 @@ pub fn conv_scalar(float_value: &schema::animated_properties::value::FloatValue)
                         .as_ref()
                         .and_then(conv_keyframe_handle),
                     hold,
+                    dimension_easings: [None; 3],
                 });
                 values.push(data);
             }
@@ -1291,6 +1277,7 @@ pub fn conv_pos_point(value: &schema::animated_properties::position::Position) -
                             in_tangent: base.in_tangent.as_ref().and_then(conv_keyframe_handle),
                             out_tangent: base.out_tangent.as_ref().and_then(conv_keyframe_handle),
                             hold: base.hold == Some(BoolInt::True),
+                            dimension_easings: [None; 3],
                         },
                         value: point(start_value),
                         out_tangent: keyframe
@@ -1949,6 +1936,45 @@ mod tests {
             value: ShapePropertyK::Animated(vec![keyframe(0.0), keyframe(10.0)]),
         };
         assert!(super::conv_shape_geometry(&property).is_none());
+    }
+
+    #[test]
+    fn keyframe_with_easing_for_each_dimension_stays_one_keyframe() {
+        use crate::runtime::model::Value;
+        let size = super::conv_size(&parse(json!({
+            "a": 1,
+            "k": [
+                {
+                    "t": 0,
+                    "s": [20, 20],
+                    "o": { "x": [0.9, 0.1], "y": [0, 0.5] },
+                    "i": { "x": [0.1, 0.9], "y": [1] },
+                },
+                { "t": 40, "s": [80, 80] },
+            ],
+        })));
+        let Value::Animated(animated) = size else {
+            panic!("expected keyframes");
+        };
+        assert_eq!(animated.times.len(), 2);
+        let first = animated.times[0];
+        let handle = |handle: crate::runtime::model::EasingHandle| (handle.x, handle.y);
+        assert_eq!(first.out_tangent.map(handle), Some((0.9, 0.0)));
+        assert_eq!(first.in_tangent.map(handle), Some((0.1, 1.0)));
+        // The second dimension takes the first value of a handle that has no second.
+        let [Some(second), None, None] = first.dimension_easings else {
+            panic!("{:?}", first.dimension_easings);
+        };
+        assert_eq!(
+            (handle(second.o), handle(second.i)),
+            ((0.1, 0.5), (0.9, 1.0))
+        );
+        assert!(
+            animated.times[1]
+                .dimension_easings
+                .iter()
+                .all(Option::is_none)
+        );
     }
 
     #[test]
