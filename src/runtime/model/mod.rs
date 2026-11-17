@@ -420,9 +420,12 @@ pub enum UnsupportedLayerFeature {
     /// The layer is kept as an empty layer that draws nothing, so that layers parented to it
     /// still follow its transform.
     LayerType(Option<u64>),
-    /// Rotation of a 3D layer about the X or Y axis, or its orientation (`rx`, `ry`, `or`).
+    /// Rotation of a 3D layer about the X or Y axis, or orientation about one of them (`rx`,
+    /// `ry` and the first two values of `or`).
     ///
-    /// The layer is drawn without them. Its rotation about the Z axis is applied.
+    /// The layer is drawn without them. Its rotation and orientation about the Z axis are
+    /// applied, unless both are animated, which is reported with this as well. Then only the
+    /// rotation is applied.
     Rotation3d,
 }
 

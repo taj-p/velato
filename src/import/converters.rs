@@ -395,12 +395,22 @@ fn has_3d_rotation(source: &AnyLayer) -> bool {
     if transform.x_rotation.is_none() {
         return false;
     }
+    // Of the orientation, the rotation about the Z axis is applied, unless it and `rz` are
+    // both animated.
+    let leaves_out_z = conv_rotation(transform).1;
+    let is_not_zero = |values: &[f64]| {
+        let about_x_or_y = values.iter().take(2).any(|value| *value != 0.0);
+        about_x_or_y || (leaves_out_z && values.get(2).is_some_and(|value| *value != 0.0))
+    };
     let orientation = transform
         .orientation
         .as_ref()
         .is_some_and(|orientation| match &orientation.animated_property.value {
-            AnimatedPropertyK::Static(values) => values.iter().any(|value| *value != 0.0),
-            AnimatedPropertyK::AnimatedValue(keyframes) => any_keyframe_is_not_zero(keyframes),
+            AnimatedPropertyK::Static(values) => is_not_zero(values),
+            AnimatedPropertyK::AnimatedValue(keyframes) => keyframes.iter().any(|keyframe| {
+                let end = keyframe.end_value_deprecated.as_deref();
+                is_not_zero(&keyframe.value) || end.is_some_and(is_not_zero)
+            }),
         });
     orientation
         || [&transform.x_rotation, &transform.y_rotation]
@@ -443,7 +453,8 @@ fn setup_unknown_layer(value: &serde_json::Value, layer: &mut Layer) -> LayerSet
 /// Returns the rotation in the plane of the composition.
 ///
 /// A 3D layer has `rx`, `ry`, `rz` and `or` in place of `r`. Its rotations about the X and Y
-/// axes and its orientation cannot be expressed by a 2D transform, so only `rz` is used.
+/// axes cannot be expressed by a 2D transform, so `rz` is used, to which [`conv_rotation`]
+/// adds the rotation about the Z axis that is part of the orientation.
 /// As in lottie-web, `rx` decides which form applies: with it `r` is not read, and without it
 /// `rz` is not.
 fn transform_rotation(transform: &schema::helpers::transform::Transform) -> &FloatValue {
@@ -454,6 +465,79 @@ fn transform_rotation(transform: &schema::helpers::transform::Transform) -> &Flo
         Some(AnyTransformR::Rotation(value)) => value,
         Some(AnyTransformR::SplitRotation { z_rotation, .. }) => z_rotation,
         None => &FLOAT_VALUE_ZERO,
+    }
+}
+
+/// Returns the rotation about the Z axis that is part of the orientation of a 3D layer, or
+/// `None` for a transform without orientation.
+fn orientation_z(transform: &schema::helpers::transform::Transform) -> Option<Value<f64>> {
+    use crate::schema::animated_properties::animated_property::AnimatedPropertyK::*;
+    // Only a 3D layer has an orientation, and `rx` is what makes a layer one.
+    transform.x_rotation.as_ref()?;
+    let z = |values: &[f64]| values.get(2).copied().unwrap_or(0.0);
+    Some(
+        match &transform.orientation.as_ref()?.animated_property.value {
+            Static(values) => Value::Fixed(z(values)),
+            AnimatedValue(keyframes) => {
+                let mut value = conv_keyframes(keyframes.iter(), z);
+                if let Value::Animated(animated) = &mut value {
+                    // lottie-web turns from one orientation to the next the short way round
+                    // and at a constant speed, whatever the easing of the keyframe. Angles
+                    // that differ by whole turns are the same orientation, so each keyframe
+                    // is moved by whole turns to where the short way from the keyframe before
+                    // it ends. Of the two ways of a half turn, lottie-web takes the one that
+                    // the angles are written with, or the other if they are an odd number of
+                    // whole turns further apart.
+                    for time in &mut animated.times {
+                        time.in_tangent = None;
+                        time.out_tangent = None;
+                        time.dimension_easings = [None; 3];
+                    }
+                    let mut written = animated.values.first().copied().unwrap_or(0.0);
+                    let mut turned = written;
+                    for value in &mut animated.values {
+                        let difference = *value - written;
+                        written = *value;
+                        turned += difference - 360.0 * (difference / 360.0).round_ties_even();
+                        *value = turned;
+                    }
+                }
+                value
+            }
+        },
+    )
+}
+
+/// Returns the sum of two values, or `None` if both are animated, which a single value with
+/// one set of keyframes cannot express.
+fn sum(first: Value<f64>, second: Value<f64>) -> Option<Value<f64>> {
+    match (first, second) {
+        (Value::Fixed(first), Value::Fixed(second)) => Some(Value::Fixed(first + second)),
+        (Value::Animated(mut animated), Value::Fixed(fixed))
+        | (Value::Fixed(fixed), Value::Animated(mut animated)) => {
+            for value in &mut animated.values {
+                *value += fixed;
+            }
+            Some(Value::Animated(animated))
+        }
+        (Value::Animated(_), Value::Animated(_)) => None,
+    }
+}
+
+/// Returns the rotation of a transform in the plane of the composition, and whether it leaves
+/// out a rotation about the Z axis that is part of the orientation.
+///
+/// lottie-web turns a 3D layer by `rz` and by its orientation, which is a rotation about each
+/// axis. Both of its rotations about the Z axis are in the plane, so they add up. They are
+/// added here unless both are animated, and then the orientation is left out.
+fn conv_rotation(transform: &schema::helpers::transform::Transform) -> (Value<f64>, bool) {
+    let rotation = conv_scalar(transform_rotation(transform));
+    let Some(orientation) = orientation_z(transform) else {
+        return (rotation, false);
+    };
+    match sum(rotation.clone(), orientation) {
+        Some(sum) => (sum, false),
+        None => (rotation, true),
     }
 }
 
@@ -473,7 +557,7 @@ pub fn conv_transform(
         anchor: conv_pos_point(value.anchor_point.as_ref().unwrap_or(&POSITION_ZERO)),
         position: conv_transform_position(&value.position),
         scale: conv_vec2(value.scale.as_ref().unwrap_or(&MULTIDIM_ONE_HUNDRED)),
-        rotation: conv_scalar(transform_rotation(value)),
+        rotation: conv_rotation(value).0,
         skew: conv_scalar(value.skew.as_ref().unwrap_or(&FLOAT_VALUE_ZERO)),
         skew_angle: conv_scalar(value.skew_axis.as_ref().unwrap_or(&FLOAT_VALUE_ZERO)),
     };
@@ -498,7 +582,7 @@ pub fn conv_shape_transform(value: &schema::shapes::transform::TransformShape) -
                 .as_ref()
                 .unwrap_or(&MULTIDIM_ONE_HUNDRED),
         ),
-        rotation: conv_scalar(transform_rotation(&value.transform)),
+        rotation: conv_rotation(&value.transform).0,
         skew: conv_scalar(value.transform.skew.as_ref().unwrap_or(&FLOAT_VALUE_ZERO)),
         skew_angle: conv_scalar(
             value
@@ -2239,6 +2323,64 @@ mod tests {
     }
 
     #[test]
+    fn orientation_about_the_z_axis_adds_to_the_rotation_of_a_3d_layer() {
+        use crate::test_support::*;
+        let rotation_at = |ks: serde_json::Value, frame: f64| {
+            let composition = composition(json!([with(layer(3, 1), json!({ "ks": ks }))]));
+            let listed = !composition.unsupported_layers.is_empty();
+            let components = composition.layers[0].transform.components(frame).unwrap();
+            (components.rotation, listed)
+        };
+        let fixed = |z: f64| json!({ "a": 0, "k": z });
+        let oriented = |ks: serde_json::Value, orientation: serde_json::Value| {
+            with(ks, json!({ "or": orientation }))
+        };
+        let about = |x: f64, y: f64, z: f64| json!({ "a": 0, "k": [x, y, z] });
+        let turning = |from: f64, to: f64| json!({ "a": 1, "k": [{ "t": 0, "s": [0, 0, from] }, { "t": 10, "s": [0, 0, to] }] });
+
+        let both = oriented(rotation_3d(0.0, 0.0, fixed(60.0)), about(0.0, 0.0, 30.0));
+        assert_eq!(rotation_at(both, 0.0), (90.0, false));
+        // The orientation about the other axes is left out, and reported.
+        let tilted = oriented(rotation_3d(0.0, 0.0, fixed(60.0)), about(10.0, 0.0, 30.0));
+        assert_eq!(rotation_at(tilted, 0.0), (90.0, true));
+        // Either of the two can be animated.
+        let spinning = oriented(rotation_3d(0.0, 0.0, fixed(60.0)), turning(0.0, 90.0));
+        assert_eq!(rotation_at(spinning.clone(), 0.0), (60.0, false));
+        assert!(close(rotation_at(spinning.clone(), 5.0).0, 105.0));
+        assert_eq!(rotation_at(spinning, 10.0), (150.0, false));
+        // An orientation turns the short way round: from 350 to 10 degrees through 0, and
+        // from 0 to 270 degrees backwards. It does so at a constant speed, whatever its easing.
+        let through_zero = oriented(rotation_3d(0.0, 0.0, fixed(0.0)), turning(350.0, 10.0));
+        assert!(close(rotation_at(through_zero, 5.0).0, 360.0));
+        let backwards = oriented(rotation_3d(0.0, 0.0, fixed(0.0)), turning(0.0, 270.0));
+        assert!(close(rotation_at(backwards, 5.0).0, -45.0));
+        let mut eased = turning(0.0, 90.0);
+        eased["k"][0]["o"] = json!({ "x": [0.9], "y": [0] });
+        eased["k"][0]["i"] = json!({ "x": [0.1], "y": [1] });
+        let eased = oriented(rotation_3d(0.0, 0.0, fixed(0.0)), eased);
+        assert!(close(rotation_at(eased, 2.5).0, 22.5));
+        let keyframes = json!({ "a": 1, "k": legacy_keyframes(json!([0]), json!([90])) });
+        let rotating = oriented(
+            rotation_3d(0.0, 0.0, keyframes.clone()),
+            about(0.0, 0.0, 30.0),
+        );
+        assert!(close(rotation_at(rotating, 5.0).0, 75.0));
+        // If both are, one rotation cannot hold their sum. The orientation is left out and
+        // reported, unless it stays at zero.
+        let unsupported = oriented(rotation_3d(0.0, 0.0, keyframes.clone()), turning(0.0, 90.0));
+        assert_eq!(rotation_at(unsupported.clone(), 10.0), (90.0, true));
+        let still = oriented(rotation_3d(0.0, 0.0, keyframes), turning(0.0, 0.0));
+        assert_eq!(rotation_at(still, 10.0), (90.0, false));
+        // A layer that is not a 3D layer has no orientation.
+        let mut plain = transform(100.0);
+        plain["r"]["k"] = json!(30);
+        assert_eq!(
+            rotation_at(oriented(plain, about(0.0, 0.0, 45.0)), 0.0),
+            (30.0, false)
+        );
+    }
+
+    #[test]
     fn rotation_keys_of_a_3d_layer_round_trip() {
         use crate::schema::helpers::transform::Transform;
         let source = json!({
@@ -2443,6 +2585,11 @@ mod tests {
         );
         let oriented = with(
             rotation_3d(0.0, 0.0, z()),
+            json!({ "or": { "a": 0, "k": [0, 20, 0] } }),
+        );
+        // An orientation about the Z axis alone is a rotation in the plane, and is supported.
+        let turned = with(
+            rotation_3d(0.0, 0.0, z()),
             json!({ "or": { "a": 0, "k": [0, 0, 30] } }),
         );
         let composition = composition_with_assets(
@@ -2457,6 +2604,7 @@ mod tests {
                 rotated(3, animated_x),
                 rotated(4, oriented),
                 precomp_layer(5, "comp"),
+                rotated(6, turned),
             ]),
         );
         let listed: Vec<_> = composition
@@ -2478,7 +2626,7 @@ mod tests {
         assert_eq!(
             trace(&composition, 0.0),
             [
-                "clip", "fill(1)", "fill(1)", "fill(1)", "fill(1)", "fill(1)", "pop"
+                "clip", "fill(1)", "fill(1)", "fill(1)", "fill(1)", "fill(1)", "fill(1)", "pop"
             ]
         );
     }

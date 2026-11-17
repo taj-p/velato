@@ -54,8 +54,9 @@
 //! - Layer effects other than Gaussian blur, drop shadow, fill, and tint
 //! - Correct color stop handling
 //! - 3D layers (of the rotation keys `rx`, `ry`, `rz` and `or`, only the rotation about the Z
-//!   axis, `rz`, is applied; `rx`, `ry` and `or` are ignored, and a layer where one of them is
-//!   not zero is listed in [`Composition::unsupported_layers`])
+//!   axis is applied, which is `rz` and the third value of `or`; `rx`, `ry` and the first two
+//!   values of `or` are ignored, and a layer where one of them is not zero is listed in
+//!   [`Composition::unsupported_layers`], as is one where `rz` and `or` are both animated)
 
 // LINEBENDER LINT SET - lib.rs - v4
 // See https://linebender.org/wiki/canonical-lints/
