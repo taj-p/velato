@@ -4,6 +4,7 @@
 use super::model::{
     Content, Draw, Geometry, GroupTransform, ImageAsset, Layer, RepeaterComposite, Shape, fixed,
 };
+use super::trim::Measured;
 use super::{
     Composition, EvaluatedComposition, EvaluatedLayer, EvaluationError, FilterEffect,
     FilterLayerResult,
@@ -11,7 +12,6 @@ use super::{
 use kurbo::{Affine, PathEl, Rect};
 use peniko::{Fill, Mix};
 use std::collections::HashMap;
-use std::mem::swap;
 use std::ops::Range;
 
 pub trait RenderSink {
@@ -731,67 +731,70 @@ impl Batch {
             return;
         }
 
-        for geometry in &self.geometries[..geometry_start] {
-            self.trim_elements
-                .extend(self.elements[geometry.elements.clone()].iter().cloned());
-        }
-
         let sequential = trim.mode == super::model::TrimMode::Sequential;
-        let paths: Vec<Vec<PathEl>> = self.geometries[geometry_start..]
-            .iter()
-            .map(|geometry| {
-                self.elements[geometry.elements.clone()]
-                    .iter()
-                    .map(|element| {
-                        if sequential {
-                            *element
-                        } else {
-                            geometry.transform * *element
-                        }
-                    })
-                    .collect()
-            })
-            .collect();
-        let mut intervals = vec![(0.0, 0.0); paths.len()];
+        let ranges: Vec<_> = [Some(first), second].into_iter().flatten().collect();
+        // Measuring a path is what takes the time, so each path is measured once. The trimmed
+        // paths are collected in `trim_elements`.
         if sequential {
-            let lengths: Vec<_> = paths.iter().map(|path| super::trim::length(path)).collect();
-            let total_length = lengths.iter().sum();
-            let mut order: Vec<_> = (0..paths.len()).collect();
+            // The trim spreads over the paths one after another, so it needs the lengths of all
+            // of them before it can trim the first.
+            let measured: Vec<_> = self.geometries[geometry_start..]
+                .iter()
+                .map(|geometry| Measured::new(&self.elements[geometry.elements.clone()]))
+                .collect();
+            let total_length = measured.iter().map(Measured::length).sum();
+            let mut order: Vec<_> = (0..measured.len()).collect();
             order.sort_unstable_by_key(|index| self.geometries[geometry_start + index].trim_order);
+            let mut intervals = vec![(0.0, 0.0); measured.len()];
             let mut offset = 0.0;
             for index in order {
                 intervals[index] = (offset, total_length);
-                offset += lengths[index];
+                offset += measured[index].length();
             }
-        }
-        let ranges: Vec<_> = [Some(first), second].into_iter().flatten().collect();
-        for ((geometry, path), interval) in self.geometries[geometry_start..]
-            .iter_mut()
-            .zip(paths)
-            .zip(intervals)
-        {
-            let new_start = self.trim_elements.len();
-            super::trim::trim(
-                &path,
-                &ranges,
-                sequential.then_some(interval),
-                &mut self.trim_elements,
-            );
-            geometry.elements = new_start..self.trim_elements.len();
-            if !sequential {
+            for ((geometry, measured), interval) in self.geometries[geometry_start..]
+                .iter_mut()
+                .zip(&measured)
+                .zip(intervals)
+            {
+                let new_start = self.trim_elements.len();
+                super::trim::trim(
+                    &self.elements[geometry.elements.clone()],
+                    measured,
+                    &ranges,
+                    Some(interval),
+                    &mut self.trim_elements,
+                );
+                geometry.elements = new_start..self.trim_elements.len();
+            }
+        } else {
+            let mut path = Vec::new();
+            for geometry in &mut self.geometries[geometry_start..] {
+                path.clear();
+                path.extend(
+                    self.elements[geometry.elements.clone()]
+                        .iter()
+                        .map(|element| geometry.transform * *element),
+                );
+                let new_start = self.trim_elements.len();
+                super::trim::trim(
+                    &path,
+                    &Measured::new(&path),
+                    &ranges,
+                    None,
+                    &mut self.trim_elements,
+                );
+                geometry.elements = new_start..self.trim_elements.len();
                 geometry.transform = Affine::IDENTITY;
             }
         }
 
-        let mut offset = 0;
-        for geometry in &mut self.geometries[..geometry_start] {
-            let len = geometry.elements.len();
-            geometry.elements = offset..offset + len;
-            offset += len;
+        // The trimmed paths go after the elements that the layer has so far, which leaves the
+        // paths that the trim does not apply to where they are.
+        let base = self.elements.len();
+        self.elements.append(&mut self.trim_elements);
+        for geometry in &mut self.geometries[geometry_start..] {
+            geometry.elements = base + geometry.elements.start..base + geometry.elements.end;
         }
-
-        swap(&mut self.elements, &mut self.trim_elements);
-        self.trim_elements.clear();
     }
 
     /// Lists the styles that make a draw call, in paint order.
@@ -1851,6 +1854,73 @@ mod tests {
             panic!("expected a draw call, got {events:?}");
         };
         assert!(bounds.x0 > 1e24 && bounds.x1 < 9e24, "{bounds:?}");
+    }
+
+    #[test]
+    fn trim_path_measures_each_curve_once() {
+        use crate::runtime::trim::SEGMENTS_MEASURED;
+        let trim = |start: f64, end: f64, mode: u8| {
+            json!({
+                "ty": "tm",
+                "s": { "a": 0, "k": start },
+                "e": { "a": 0, "k": end },
+                "o": { "a": 0, "k": 0 },
+                "m": mode,
+            })
+        };
+        let measured = |shapes: serde_json::Value| {
+            let composition = composition(json!([shape_layer(1, shapes)]));
+            SEGMENTS_MEASURED.with(|count| count.set(0));
+            assert_eq!(trace(&composition, 0.0), ["clip", "stroke(1)", "pop"]);
+            SEGMENTS_MEASURED.with(|count| count.get())
+        };
+        // An open path of four segments.
+        let zigzag = |x: f64| {
+            json!({
+                "ty": "sh",
+                "ks": {
+                    "a": 0,
+                    "k": {
+                        "c": false,
+                        "v": [[x, 0], [x + 5.0, 10], [x + 10.0, 0], [x + 15.0, 10], [x + 20.0, 0]],
+                        "i": [[0, 0], [0, 0], [0, 0], [0, 0], [0, 0]],
+                        "o": [[0, 0], [0, 0], [0, 0], [0, 0], [0, 0]],
+                    },
+                },
+            })
+        };
+        // Measuring takes far longer than anything else a trim does, and it used to be done up
+        // to three times over.
+        for mode in [1, 2] {
+            let shapes = json!([
+                zigzag(0.0),
+                zigzag(30.0),
+                stroke(100.0),
+                trim(10.0, 90.0, mode)
+            ]);
+            assert_eq!(measured(shapes), 8, "mode {mode}");
+        }
+        // A trim only measures the paths that it applies to, and what the trim before it left
+        // of them: here the eight segments, and then the three that the first trim cut each
+        // path down to.
+        let shapes = json!([
+            zigzag(60.0),
+            group(
+                vec![
+                    zigzag(0.0),
+                    zigzag(30.0),
+                    trim(0.0, 60.0, 1),
+                    trim(10.0, 90.0, 1),
+                    stroke(100.0)
+                ],
+                100.0
+            ),
+            stroke(100.0),
+        ]);
+        let composition = composition(json!([shape_layer(1, shapes)]));
+        SEGMENTS_MEASURED.with(|count| count.set(0));
+        assert_eq!(trace(&composition, 0.0).len(), 4);
+        assert_eq!(SEGMENTS_MEASURED.with(|count| count.get()), 8 + 6);
     }
 
     /// A shape layer with one fill and the given blend mode (`bm`).

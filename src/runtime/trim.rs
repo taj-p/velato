@@ -144,50 +144,124 @@ fn measuring_scale(elements: &[PathEl]) -> Option<f64> {
     }
 }
 
-fn scaled_length(elements: &[PathEl], scale: f64) -> f64 {
-    segments(elements.iter().copied())
-        .map(|segment| segment_length(segment, scale))
-        .sum()
+/// Splits a path into its contours. A contour ends before a move, and after a close.
+fn contours(elements: &[PathEl]) -> impl Iterator<Item = &[PathEl]> {
+    let mut rest = elements;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let end = (1..rest.len())
+            .find(|&end| {
+                matches!(rest[end], PathEl::MoveTo(_)) || matches!(rest[end - 1], PathEl::ClosePath)
+            })
+            .unwrap_or(rest.len());
+        let (contour, tail) = rest.split_at(end);
+        rest = tail;
+        Some(contour)
+    })
 }
 
-/// Returns the length of a path, or zero if it has coordinates that are not finite.
-pub(crate) fn length(elements: &[PathEl]) -> f64 {
-    match measuring_scale(elements) {
-        None => 0.0,
-        Some(1.0) => scaled_length(elements, 1.0),
-        Some(scale) => {
-            let scaled: Vec<_> = elements
-                .iter()
-                .map(|element| Affine::scale(scale) * *element)
-                .collect();
-            scaled_length(&scaled, scale) / scale
-        }
+/// Returns the segments of a contour.
+fn contour_segments(contour: &[PathEl]) -> impl Iterator<Item = PathSeg> + '_ {
+    // A contour cannot start with a close, and has no segments if it does.
+    let contour = match contour.first() {
+        Some(PathEl::ClosePath) => &[],
+        _ => contour,
+    };
+    segments(contour.iter().copied())
+}
+
+/// Returns a copy of a path scaled by `scale`, or the path itself if that is 1.
+fn scaled(elements: &[PathEl], scale: f64) -> std::borrow::Cow<'_, [PathEl]> {
+    if scale == 1.0 {
+        elements.into()
+    } else {
+        elements
+            .iter()
+            .map(|element| Affine::scale(scale) * *element)
+            .collect()
     }
 }
 
-/// Appends the parts of a path that lie within `ranges` to `output`.
+#[cfg(test)]
+thread_local! {
+    /// Number of segments measured on this thread.
+    pub(crate) static SEGMENTS_MEASURED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The lengths of the segments of a path.
+///
+/// Measuring is what takes the time in trimming, so a path is measured once, and trimmed with
+/// what was measured.
+#[derive(Clone, Debug)]
+pub(crate) struct Measured {
+    /// The factor that the path is scaled by for measuring and trimming it: 1 for all but
+    /// extreme coordinates. `None` if the path has a coordinate that is not finite, and so has
+    /// no length to measure.
+    scale: Option<f64>,
+    /// The length of each segment of the scaled path, contour by contour.
+    lengths: Vec<f64>,
+}
+
+impl Measured {
+    pub(crate) fn new(elements: &[PathEl]) -> Self {
+        let scale = measuring_scale(elements);
+        let mut lengths = Vec::new();
+        if let Some(scale) = scale {
+            let elements = scaled(elements, scale);
+            for contour in contours(&elements) {
+                lengths.extend(contour_segments(contour).map(|segment| {
+                    #[cfg(test)]
+                    SEGMENTS_MEASURED.with(|count| count.set(count.get() + 1));
+                    segment_length(segment, scale)
+                }));
+            }
+        }
+        Self { scale, lengths }
+    }
+
+    /// Returns the length of the path, or zero if it has coordinates that are not finite.
+    pub(crate) fn length(&self) -> f64 {
+        self.scale
+            .map_or(0.0, |scale| self.lengths.iter().sum::<f64>() / scale)
+    }
+}
+
+/// Returns the length of a path, or zero if it has coordinates that are not finite.
+#[cfg(test)]
+pub(crate) fn length(elements: &[PathEl]) -> f64 {
+    Measured::new(elements).length()
+}
+
+/// Appends the parts of a path that lie within `ranges` to `output`. `measured` holds the
+/// lengths of the path.
 ///
 /// A path with coordinates that are not finite cannot be measured and is appended untrimmed.
 pub(crate) fn trim(
     elements: &[PathEl],
+    measured: &Measured,
     ranges: &[(f64, f64)],
     sequential: Option<(f64, f64)>,
     output: &mut Vec<PathEl>,
 ) {
-    match measuring_scale(elements) {
-        None => output.extend_from_slice(elements),
-        Some(1.0) => trim_scaled(elements, 1.0, ranges, sequential, output),
-        Some(scale) => {
-            let scaled: Vec<_> = elements
-                .iter()
-                .map(|element| Affine::scale(scale) * *element)
-                .collect();
-            let sequential = sequential.map(|(offset, total)| (offset * scale, total * scale));
-            let start = output.len();
-            trim_scaled(&scaled, scale, ranges, sequential, output);
-            for element in &mut output[start..] {
-                *element = Affine::scale(1.0 / scale) * *element;
-            }
+    let Some(scale) = measured.scale else {
+        output.extend_from_slice(elements);
+        return;
+    };
+    let sequential = sequential.map(|(offset, total)| (offset * scale, total * scale));
+    let start = output.len();
+    trim_scaled(
+        &scaled(elements, scale),
+        scale,
+        &measured.lengths,
+        ranges,
+        sequential,
+        output,
+    );
+    if scale != 1.0 {
+        for element in &mut output[start..] {
+            *element = Affine::scale(1.0 / scale) * *element;
         }
     }
 }
@@ -195,21 +269,18 @@ pub(crate) fn trim(
 fn trim_scaled(
     elements: &[PathEl],
     scale: f64,
+    lengths: &[f64],
     ranges: &[(f64, f64)],
     sequential: Option<(f64, f64)>,
     output: &mut Vec<PathEl>,
 ) {
     let mut offset = sequential.map_or(0.0, |(offset, _)| offset);
-    let mut start = 0;
-    for end in 1..=elements.len() {
-        if end != elements.len()
-            && !matches!(elements[end], PathEl::MoveTo(_))
-            && !matches!(elements[end - 1], PathEl::ClosePath)
-        {
-            continue;
-        }
-        let contour = &elements[start..end];
-        let contour_length = scaled_length(contour, scale);
+    let mut lengths = lengths;
+    for contour in contours(elements) {
+        let segment_count = contour_segments(contour).count().min(lengths.len());
+        let (contour_lengths, rest) = lengths.split_at(segment_count);
+        lengths = rest;
+        let contour_length: f64 = contour_lengths.iter().sum();
         let (base, total) = sequential.map_or((0.0, contour_length), |(_, total)| (offset, total));
         let intervals: Vec<_> = ranges
             .iter()
@@ -227,29 +298,33 @@ fn trim_scaled(
         {
             output.extend_from_slice(contour);
         } else if !intervals.is_empty() {
-            trim_contour(contour, scale, &intervals, contour_length, output);
+            trim_contour(
+                contour,
+                scale,
+                contour_lengths,
+                &intervals,
+                contour_length,
+                output,
+            );
         }
         offset += contour_length;
-        start = end;
     }
 }
 
 fn trim_contour(
     elements: &[PathEl],
     scale: f64,
+    lengths: &[f64],
     intervals: &[(f64, f64)],
     length: f64,
     output: &mut Vec<PathEl>,
 ) {
-    let segments: Vec<_> = segments(elements.iter().copied())
-        .map(|segment| (segment, segment_length(segment, scale)))
-        .collect();
     let closed = matches!(elements.last(), Some(PathEl::ClosePath));
     let mut previous_end = None;
     for &(start, end) in intervals {
         let mut need_move = !(closed && previous_end == Some(length) && start == 0.0);
         let mut position = 0.0;
-        for &(segment, segment_length) in &segments {
+        for (segment, &segment_length) in contour_segments(elements).zip(lengths) {
             if position >= end {
                 break;
             }
@@ -282,7 +357,7 @@ fn trim_contour(
 
 #[cfg(test)]
 mod tests {
-    use super::{length, trim};
+    use super::{Measured, length, trim};
     use kurbo::{PathEl, Point, Shape as _};
     use std::time::{Duration, Instant};
 
@@ -302,7 +377,7 @@ mod tests {
 
     fn trimmed_half(path: &[PathEl]) -> Vec<PathEl> {
         let mut output = Vec::new();
-        trim(path, &[(0.0, 0.5)], None, &mut output);
+        trim(path, &Measured::new(path), &[(0.0, 0.5)], None, &mut output);
         output
     }
 
