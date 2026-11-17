@@ -834,7 +834,8 @@ fn conv_draw(value: &schema::shapes::AnyShape) -> Option<runtime::model::Draw> {
                     .base_stroke
                     .line_join
                     .as_ref()
-                    .unwrap_or(&LineJoin::Bevel)
+                    // A stroke that names no join or cap has round ones, as in lottie-web.
+                    .unwrap_or(&LineJoin::Round)
                 {
                     LineJoin::Bevel => Join::Bevel,
                     LineJoin::Round => Join::Round,
@@ -845,7 +846,7 @@ fn conv_draw(value: &schema::shapes::AnyShape) -> Option<runtime::model::Draw> {
                     .base_stroke
                     .line_cap
                     .as_ref()
-                    .unwrap_or(&LineCap::Butt)
+                    .unwrap_or(&LineCap::Round)
                 {
                     LineCap::Butt => Cap::Butt,
                     LineCap::Round => Cap::Round,

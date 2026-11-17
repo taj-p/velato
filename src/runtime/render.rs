@@ -3857,4 +3857,50 @@ mod tests {
         assert!(composition.evaluate(0.0).is_ok());
         assert_eq!(trace(&composition, 0.0), ["clip", "fill(1)", "pop"]);
     }
+
+    #[test]
+    fn stroke_without_a_cap_or_join_is_round() {
+        use crate::runtime::model::{Content, Shape};
+        use kurbo::{Cap, Join};
+        let document = |stroke: serde_json::Value| {
+            let shapes = json!([rect(0.0, 0.0, 10.0, 10.0), stroke]);
+            json!({
+                "v": "5.7.14", "fr": 60, "ip": 0, "op": 60, "w": 100, "h": 100,
+                "layers": [shape_layer(1, shapes)],
+            })
+        };
+        // The cap, the join and the miter limit of the stroke that is handed to the sink.
+        let style = |stroke: serde_json::Value| {
+            let composition = crate::Composition::from_json(document(stroke)).unwrap();
+            let Content::Shape(shapes) = &composition.layers[0].content else {
+                panic!("a shape layer has shapes");
+            };
+            let stroke = shapes
+                .iter()
+                .find_map(|shape| match shape {
+                    Shape::Draw(draw) => draw.stroke.as_ref(),
+                    _ => None,
+                })
+                .expect("the layer has a stroke")
+                .evaluate(0.0)
+                .into_owned();
+            assert_eq!(stroke.start_cap, stroke.end_cap);
+            (stroke.start_cap, stroke.join, stroke.miter_limit)
+        };
+        for stroke in [stroke(100.0), gradient("gs", 100.0)] {
+            assert_eq!(style(stroke.clone()), (Cap::Round, Join::Round, 4.0));
+            // One that names only one of the two has the other round.
+            let butt = with(stroke.clone(), json!({ "lc": 1 }));
+            assert_eq!(style(butt), (Cap::Butt, Join::Round, 4.0));
+            let miter = with(stroke.clone(), json!({ "lj": 1, "ml": 7 }));
+            assert_eq!(style(miter), (Cap::Round, Join::Miter, 7.0));
+            let square = with(stroke.clone(), json!({ "lc": 3, "lj": 3 }));
+            assert_eq!(style(square), (Cap::Square, Join::Bevel, 4.0));
+            // Zero is neither a cap nor a join, and is still refused.
+            for key in ["lc", "lj"] {
+                let none = with(stroke.clone(), json!({ key: 0 }));
+                assert!(crate::Composition::from_json(document(none)).is_err());
+            }
+        }
+    }
 }
